@@ -775,25 +775,26 @@ export const createAiPricingRuleController = async (req, res) => {
       });
     }
 
-    const trimmedModel = model.trim().toLowerCase();
+    if (typeof model !== "string") return res.status(400).json({ success: false, message: "Invalid model ID" });
+    const trimmedModel = model.trim();
     if (!trimmedModel) {
       return res
         .status(400)
         .json({ success: false, message: "Model name cannot be empty" });
     }
 
-    const parsedInputRate = parseFloat(input_rate);
-    const parsedOutputRate = parseFloat(output_rate);
-    if (isNaN(parsedInputRate) || parsedInputRate <= 0) {
+    const parsedInputRate = Number(input_rate);
+    const parsedOutputRate = Number(output_rate);
+    if (!Number.isFinite(parsedInputRate) || parsedInputRate < 0) {
       return res.status(400).json({
         success: false,
-        message: "Input rate must be greater than zero",
+        message: "Input rate must be non-negative",
       });
     }
-    if (isNaN(parsedOutputRate) || parsedOutputRate <= 0) {
+    if (!Number.isFinite(parsedOutputRate) || parsedOutputRate < 0) {
       return res.status(400).json({
         success: false,
-        message: "Output rate must be greater than zero",
+        message: "Output rate must be non-negative",
       });
     }
 
@@ -833,6 +834,7 @@ export const createAiPricingRuleController = async (req, res) => {
       description || null,
       finalRecommendedFor,
       finalCategory,
+      req.body.cached_input_price_per_million ?? null,
     );
     return res
       .status(201)
@@ -897,6 +899,7 @@ export const updateAiPricingRuleController = async (req, res) => {
     const VALID_CATEGORY = ["premium", "mid-tier", "budget", "reasoning"];
 
     const rule = await updateAiPricingRuleService(id, {
+      cached_input_price_per_million: req.body.cached_input_price_per_million,
       input_rate: input_rate !== undefined ? parseFloat(input_rate) : undefined,
       output_rate:
         output_rate !== undefined ? parseFloat(output_rate) : undefined,
@@ -904,7 +907,7 @@ export const updateAiPricingRuleController = async (req, res) => {
         markup_percent !== undefined ? parseFloat(markup_percent) : undefined,
       usd_to_inr_rate:
         usd_to_inr_rate !== undefined ? parseFloat(usd_to_inr_rate) : undefined,
-      is_active,
+      is_active: is_active === false || is_active === "false" ? false : is_active === undefined ? undefined : true,
       description: description !== undefined ? description : undefined,
       recommended_for:
         recommended_for !== undefined &&

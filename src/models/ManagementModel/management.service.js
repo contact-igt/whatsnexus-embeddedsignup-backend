@@ -1,3 +1,5 @@
+import { validatePricing, ModelConfigurationError } from "../../utils/ai/modelProfile.js";
+import { invalidateCatalogCaches } from "../AiModelCatalogModel/catalog.service.js";
 import bcrypt from "bcrypt";
 import db from "../../database/index.js";
 import { tableNames } from "../../database/tableName.js";
@@ -389,77 +391,39 @@ export const getAiPricingRulesService = async () => {
 };
 
 export const createAiPricingRuleService = async (
-  model,
-  input_rate,
-  output_rate,
-  markup_percent = 0,
-  usd_to_inr_rate = DEFAULT_USD_TO_INR,
-  description = null,
-  recommended_for = "both",
-  category = "mid-tier",
+  model, input_rate, output_rate, markup_percent = 0, usd_to_inr_rate = DEFAULT_USD_TO_INR,
+  description = null, recommended_for = "both", category = "mid-tier", cached_input_price_per_million = null,
 ) => {
-  try {
-    const existing = await db.AiPricing.findOne({ where: { model } });
-    if (existing) {
-      throw new Error(`AI pricing rule already exists for model: ${model}`);
-    }
-
-    const rule = await db.AiPricing.create({
-      model,
-      input_rate,
-      output_rate,
-      markup_percent,
-      usd_to_inr_rate,
-      description,
-      recommended_for,
-      category,
-      is_active: true,
-    });
-    return rule;
-  } catch (err) {
-    throw err;
-  }
+  const data = { model, input_rate, output_rate, markup_percent, usd_to_inr_rate, description, recommended_for, category, cached_input_price_per_million, pricing_version: 1, is_active: false };
+  validatePricing(data);
+  if (!await db.AiModelCatalog.findOne({ where: { model, provider: "openai" } })) throw new ModelConfigurationError("Discover the model in the catalog before configuring pricing.");
+  if (await db.AiPricing.findOne({ where: { model } })) throw new ModelConfigurationError("Pricing already exists for this exact model.");
+  const rule = await db.AiPricing.create(data);
+  invalidateCatalogCaches();
+  return rule;
 };
 
 export const updateAiPricingRuleService = async (id, data) => {
-  try {
-    const rule = await db.AiPricing.findByPk(id);
-    if (!rule) {
-      throw new Error("AI pricing rule not found");
-    }
-
-    const updateFields = {};
-    if (data.input_rate !== undefined)
-      updateFields.input_rate = data.input_rate;
-    if (data.output_rate !== undefined)
-      updateFields.output_rate = data.output_rate;
-    if (data.markup_percent !== undefined)
-      updateFields.markup_percent = data.markup_percent;
-    if (data.usd_to_inr_rate !== undefined)
-      updateFields.usd_to_inr_rate = data.usd_to_inr_rate;
-    if (data.is_active !== undefined) updateFields.is_active = data.is_active;
-    if (data.description !== undefined)
-      updateFields.description = data.description;
-    if (data.recommended_for !== undefined)
-      updateFields.recommended_for = data.recommended_for;
-    if (data.category !== undefined) updateFields.category = data.category;
-
-    await rule.update(updateFields);
+  if (data.is_active !== undefined && data.is_active !== false) throw new ModelConfigurationError("Use the catalog activation action after review and testing.");
+  const result = await db.sequelize.transaction(async transaction => {
+    const rule = await db.AiPricing.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
+    if (!rule) throw new ModelConfigurationError("AI pricing rule not found.");
+    const fields = ["input_rate", "output_rate", "cached_input_price_per_million", "markup_percent", "usd_to_inr_rate", "description", "recommended_for", "category", "is_active"];
+    const update = Object.fromEntries(fields.filter(field => data[field] !== undefined).map(field => [field, data[field]]));
+    validatePricing({ ...rule.toJSON(), ...update });
+    const billable = ["input_rate", "output_rate", "cached_input_price_per_million", "markup_percent", "usd_to_inr_rate"];
+    if (billable.some(field => data[field] !== undefined && String(data[field]) !== String(rule[field]))) update.pricing_version = Number(rule.pricing_version) + 1;
+    await rule.update(update, { transaction });
     return rule;
-  } catch (err) {
-    throw err;
-  }
+  });
+  invalidateCatalogCaches();
+  return result;
 };
 
-export const deleteAiPricingRuleService = async (id) => {
-  try {
-    const rule = await db.AiPricing.findByPk(id);
-    if (!rule) {
-      throw new Error("AI pricing rule not found");
-    }
-    await rule.destroy();
-    return { deleted: true };
-  } catch (err) {
-    throw err;
-  }
+export const deleteAiPricingRuleService = async id => {
+  const rule = await db.AiPricing.findByPk(id);
+  if (!rule) throw new ModelConfigurationError("AI pricing rule not found.");
+  await rule.update({ is_active: false });
+  invalidateCatalogCaches();
+  return { deleted: false, archived: true };
 };

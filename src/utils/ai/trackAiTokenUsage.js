@@ -16,7 +16,7 @@ import { recordHealthEvent } from "../billing/billingHealthMonitor.js";
  * @param {string} source - Origin of the call (whatsapp, playground, classifier, knowledge, language_detect)
  * @param {object} response - The full OpenAI response object (with usage property)
  */
-export const trackAiTokenUsage = async (tenant_id, source, response) => {
+export const trackAiTokenUsage = async (tenant_id, source, response, context = null) => {
   try {
     if (!response?.usage) return;
 
@@ -25,7 +25,14 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
       completion_tokens = 0,
       total_tokens = 0,
     } = response.usage;
-    const rawModel = response.model || "gpt-4o-mini";
+    const rawModel = response.model;
+    const modelSnapshot = context ? {
+      requested_model: context.requestedModel, actual_model: context.actualModel, pricing_model: context.pricing.model,
+      pricing_rule_id: context.pricing.id, endpoint: context.endpoint, fallback_reason: context.fallbackReason,
+      input_tokens: context.usage.inputTokens, cached_input_tokens: context.usage.cachedInputTokens,
+      output_tokens: context.usage.outputTokens, reasoning_tokens: context.usage.reasoningTokens,
+      cached_input_price_per_million: context.pricing.cached_input_price_per_million,
+    } : {};
 
     // 1. Check usage limits
     const usageCheck = await checkUsageLimit(tenant_id, "ai_call");
@@ -47,11 +54,13 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
         rawModel,
         prompt_tokens,
         completion_tokens,
+        context,
       );
       const limitUsageRecord = await db.AiTokenUsage.create({
         tenant_id,
         model: costResult.model,
         source,
+        ...modelSnapshot,
         prompt_tokens,
         completion_tokens,
         total_tokens,
@@ -88,6 +97,7 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
       rawModel,
       prompt_tokens,
       completion_tokens,
+      context,
     );
     const model = costResult.model;
     const pricingSnapshot = costResult.pricingSnapshot;
@@ -122,6 +132,7 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
           tenant_id,
           model,
           source,
+          ...modelSnapshot,
           prompt_tokens,
           completion_tokens,
           total_tokens,

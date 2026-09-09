@@ -1,3 +1,4 @@
+import catalogRouter from "../AiModelCatalogModel/catalog.routes.js";
 import express from "express";
 import {
   deleteManagmentByIdController,
@@ -35,6 +36,7 @@ import {
 } from "../../middlewares/auth/authMiddlewares.js";
 
 const Router = express.Router();
+Router.use("/ai-model-catalog", catalogRouter);
 
 Router.post(
   "/register",

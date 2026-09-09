@@ -77,6 +77,7 @@ import { runMissingMessageBillingReconciliationCron } from "./cron/reconciliatio
 import { runMetaTierReconciliationCron } from "./cron/metaTierReconciliationCron.js";
 import { retryUnmatchedStatusEvents } from "./services/metaMessagingLimit.service.js";
 import { runScheduledMessageCron } from "./cron/scheduledMessageCron.js";
+import { runAiModelCatalogSyncCron } from "./cron/aiModelCatalogSyncCron.js";
 import { recoverPendingHandoffEvents } from "./services/aiHandoffOutbox.service.js";
 import { initBillingReconciliationCron } from "./cron/billingReconciliationCron.js"; // B-2: Orphaned reservation reconciliation
 import { cleanupExpiredSessions } from "./models/AppointmentModel/appointmentConversation.service.js";
@@ -423,6 +424,12 @@ cron.schedule("* * * * *", () => {
 cron.schedule("0 4 * * *", async () => {
   await runHardDeleteCron();
 }); // Daily at 04:00 UTC
+
+// AI model catalog: discover new OpenAI models once daily. Additive only —
+// new models land as pending/hidden; never activated or priced automatically.
+cron.schedule("40 1 * * *", () => {
+  void runAiModelCatalogSyncCron();
+}); // Daily at 01:40 UTC
 
 // FAQ: purge hard-deleted knowledge chunks older than 30 days
 cron.schedule("0 3 * * *", async () => {

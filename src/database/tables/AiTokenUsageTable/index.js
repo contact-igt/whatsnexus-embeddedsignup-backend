@@ -15,6 +15,17 @@ export const AiTokenUsageTable = (sequelize, Sequelize) => {
         type: Sequelize.STRING,
         allowNull: false,
       },
+      requested_model: Sequelize.STRING,
+      actual_model: Sequelize.STRING,
+      pricing_model: Sequelize.STRING,
+      endpoint: Sequelize.STRING(32),
+      pricing_rule_id: Sequelize.INTEGER,
+      fallback_reason: Sequelize.STRING,
+      input_tokens: Sequelize.INTEGER,
+      cached_input_tokens: Sequelize.INTEGER,
+      output_tokens: Sequelize.INTEGER,
+      reasoning_tokens: Sequelize.INTEGER,
+      cached_input_price_per_million: Sequelize.DECIMAL(10, 4),
 
       model: {
         type: Sequelize.STRING,

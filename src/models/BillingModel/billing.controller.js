@@ -276,8 +276,25 @@ export const updateAutoRechargeSettingsController = async (req, res) => {
 
 export const getAvailableAiModelsController = async (req, res) => {
   try {
-    const data = await getAvailableAiModelsService();
-    return res.status(200).json({ success: true, data });
+    const management = req.user.user_type === "management";
+    if (management && !["super_admin", "platform_admin"].includes(req.user.role)) return res.status(403).json({ success: false, message: "Access denied" });
+    const tenantId = management ? req.query.tenant_id || null : req.user.tenant_id;
+    if (!management && !tenantId) return res.status(403).json({ success: false, message: "Tenant required" });
+    const purpose = req.query.purpose || "output";
+    if (!["input", "output", "vision"].includes(purpose)) return res.status(400).json({ success: false, message: "Invalid purpose" });
+    const result = await getAvailableAiModelsService(tenantId, purpose);
+    // `data` stays an array for backward compatibility; the saved-but-unavailable
+    // selection is surfaced separately in `meta` (spec §11 — never silently swap).
+    return res.status(200).json({
+      success: true,
+      data: result.models,
+      meta: {
+        purpose: result.purpose,
+        saved_selection: result.saved_selection,
+        saved_selection_entry: result.saved_selection_entry,
+        saved_selection_unavailable: !!result.saved_selection_entry && result.saved_selection_entry.availability === "unavailable",
+      },
+    });
   } catch (error) {
     logger.error("Error in getAvailableAiModelsController:", error);
     return res.status(500).json({ success: false, message: error.message });

@@ -31,6 +31,7 @@ export const storeSecret = async (tenant_id, type, plaintext) => {
       ],
     },
   );
+  if (type === "openai") { const { invalidateOpenAIClient } = await import("../../utils/ai/getOpenAIClient.js"); invalidateOpenAIClient(tenant_id); }
 };
 
 /**
@@ -70,4 +71,5 @@ export const deleteSecret = async (tenant_id, type) => {
     `DELETE FROM ${tableNames.TENANT_SECRETS} WHERE tenant_id = ? AND type = ?`,
     { replacements: [tenant_id, type] },
   );
+  if (type === "openai") { const { invalidateOpenAIClient } = await import("../../utils/ai/getOpenAIClient.js"); invalidateOpenAIClient(tenant_id); }
 };

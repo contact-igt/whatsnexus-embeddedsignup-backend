@@ -8,6 +8,9 @@ import { recordHealthEvent } from "../../utils/billing/billingHealthMonitor.js";
 
 // Default token estimate for AI calls when exact count is unknown
 const AVG_TOKEN_ESTIMATE = { prompt: 1000, completion: 500 };
+// Flat INR estimate used only when exact model pricing cannot be resolved for
+// the pre-request guard (covers ~1500 tokens on a premium model with headroom).
+const FALLBACK_AI_GUARD_ESTIMATE_INR = 5;
 
 const handleBillingGuardFailure = async (res, guardName, tenant_id, error) => {
   console.error(`[BILLING-GUARD] ${guardName} error:`, error.message);
@@ -210,13 +213,25 @@ export const requireAiAccess = async (req, res, next) => {
     const tenant_id = req.user?.tenant_id;
     if (!tenant_id) return next();
 
+    // Pre-request conservative estimate. If the model is not yet an approved,
+    // priced catalog entry, fall back to a flat guard estimate instead of
+    // blocking the route — exact pricing is enforced later at execution time.
     const model = req.body.model || "gpt-4o-mini";
-    const cost = await estimateAiCost(
-      model,
-      AVG_TOKEN_ESTIMATE.prompt,
-      AVG_TOKEN_ESTIMATE.completion,
-    );
-    const estimated_cost = cost.finalCostInr;
+    let estimated_cost;
+    try {
+      const cost = await estimateAiCost(
+        model,
+        AVG_TOKEN_ESTIMATE.prompt,
+        AVG_TOKEN_ESTIMATE.completion,
+      );
+      estimated_cost = cost.finalCostInr;
+    } catch (estimateError) {
+      if (estimateError?.code && String(estimateError.code).startsWith("AI_")) {
+        estimated_cost = FALLBACK_AI_GUARD_ESTIMATE_INR;
+      } else {
+        throw estimateError;
+      }
+    }
 
     // Usage limit check
     const usageCheck = await checkUsageLimit(tenant_id, "ai_call");

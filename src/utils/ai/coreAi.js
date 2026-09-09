@@ -1,6 +1,4 @@
-import { trackAiTokenUsage } from "./trackAiTokenUsage.js";
-import { getTenantAiModel } from "./getTenantAiModel.js";
-import { getOpenAIClient } from "./getOpenAIClient.js";
+import { runApprovedModel } from "./runApprovedModel.js";
 
 /**
  * Token limits by source — prevents runaway token usage.
@@ -54,40 +52,7 @@ export const callAI = async ({
   topP,
 }) => {
   const modelType = INPUT_MODEL_SOURCES.includes(source) ? "input" : "output";
-  const model = await getTenantAiModel(tenant_id, modelType);
-  const openai = await getOpenAIClient(tenant_id);
-
-  const params = {
-    model,
-    messages,
-    temperature,
-    max_tokens: maxTokens || TOKEN_LIMITS[source] || 150,
-  };
-  if (responseFormat) params.response_format = responseFormat;
-  if (topP !== undefined) params.top_p = topP;
-
-  const response = await openai.chat.completions.create(params);
-
-  // Track token usage (non-blocking)
-  if (tenant_id) {
-    trackAiTokenUsage(tenant_id, source, response).catch((e) =>
-      console.error(`[AI-SERVICE:${source}] Token tracking failed:`, e.message),
-    );
-  }
-
-  const rawContent = response.choices?.[0]?.message?.content;
-  if (rawContent == null) {
-    console.warn(
-      `[AI-SERVICE:${source}] OpenAI returned null content for tenant ${tenant_id}`,
-    );
-  }
-
-  return {
-    content: rawContent?.trim() || "",
-    finishReason: response.choices?.[0]?.finish_reason || "unknown",
-    usage: response.usage || {},
-    raw: response,
-  };
+  return runApprovedModel({ tenantId: tenant_id, purpose: modelType, source, messages, temperature, topP, responseFormat, maxTokens: maxTokens || TOKEN_LIMITS[source] || 150 });
 };
 
 /**

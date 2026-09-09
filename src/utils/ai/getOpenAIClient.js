@@ -1,10 +1,11 @@
+import { invalidateModelAccess } from "./modelAccess.js";
 import OpenAI from "openai";
 import { getSecret } from "../../models/TenantSecretsModel/tenantSecrets.service.js";
 import db from "../../database/index.js";
 import { decrypt } from "../encryption.js";
 
 // Cache resolved tenant keys for 5 minutes to avoid repeated DB + decrypt round-trips.
-// We cache a boolean flag (not the raw key) to detect cache misses cleanly.
+// Resolved secrets are held only in this private process-local map for the TTL.
 const tenantKeyCache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 
@@ -16,7 +17,7 @@ const CACHE_TTL = 5 * 60 * 1000;
  *   3. ai_settings JSON column — legacy CBC fallback for tenants not yet migrated
  *   4. Global OPENAI_API_KEY env var
  *
- * The raw key is never stored in cache or logs.
+ * Resolved keys are cached in private process memory, never logged or returned by APIs.
  */
 export const getOpenAIClient = async (tenant_id = null) => {
   let apiKey = process.env.OPENAI_API_KEY;
@@ -65,3 +66,8 @@ export const getOpenAIClient = async (tenant_id = null) => {
 
   return new OpenAI({ apiKey });
 };
+
+export function invalidateOpenAIClient(tenantId) {
+  if (tenantId) tenantKeyCache.delete(tenantId); else tenantKeyCache.clear();
+  invalidateModelAccess(tenantId);
+}

@@ -49,6 +49,10 @@ export const AiPricingTable = (sequelize, Sequelize) => {
         allowNull: false,
         comment: "Cost per 1M output tokens in USD",
       },
+      cached_input_price_per_million: {
+        type: Sequelize.DECIMAL(10, 4),
+        allowNull: true,
+      },
 
       markup_percent: {
         type: Sequelize.DECIMAL(5, 2),

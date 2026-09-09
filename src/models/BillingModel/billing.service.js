@@ -1,3 +1,4 @@
+import { availableModels } from "../../utils/ai/modelRuntime.js";
 import db from "../../database/index.js";
 import { Op } from "sequelize";
 import cron from "node-cron";
@@ -1416,40 +1417,7 @@ export const updateAutoRechargeSettingsService = async (
   }
 };
 
-export const getAvailableAiModelsService = async () => {
-  const models = await db.AiPricing.findAll({
-    where: { is_active: true },
-    attributes: [
-      "id",
-      "model",
-      "description",
-      "recommended_for",
-      "category",
-      "input_rate",
-      "output_rate",
-      "usd_to_inr_rate",
-    ],
-    order: [
-      ["category", "ASC"],
-      ["input_rate", "ASC"],
-    ],
-    raw: true,
-  });
-
-  return models.map((m) => {
-    const usdToInr = parseFloat(m.usd_to_inr_rate) || DEFAULT_USD_TO_INR;
-    const inputUsd = parseFloat(m.input_rate);
-    const outputUsd = parseFloat(m.output_rate);
-    return {
-      ...m,
-      input_rate: inputUsd,
-      output_rate: outputUsd,
-      input_rate_inr: inputUsd * usdToInr,
-      output_rate_inr: outputUsd * usdToInr,
-      usd_to_inr_rate: usdToInr,
-    };
-  });
-};
+export const getAvailableAiModelsService = (tenantId, purpose) => availableModels(tenantId, purpose);
 
 /**
  * Super Admin: Add manual credit to a tenant's wallet

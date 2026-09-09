@@ -1,3 +1,5 @@
+import { eligibleModel } from "../../utils/ai/modelRuntime.js";
+import { invalidateOpenAIClient } from "../../utils/ai/getOpenAIClient.js";
 ﻿import db from "../../database/index.js";
 import { tableNames } from "../../database/tableName.js";
 import { generateReadableIdFromLast } from "../../utils/helpers/generateReadableIdFromLast.js";
@@ -94,29 +96,31 @@ const validatePlanIdExists = async (plan_id) => {
   }
 };
 
-const validateAiModelSelections = async (ai_settings) => {
-  if (!ai_settings) return null;
-
-  const { input_model, output_model } = ai_settings;
-  if (!input_model && !output_model) return null;
-
-  const activeModels = await db.AiPricing.findAll({
-    where: { is_active: true },
-    attributes: ["model"],
-    raw: true,
-  });
-
-  const validModels = new Set(activeModels.map((m) => m.model));
-
-  if (input_model && !validModels.has(input_model)) {
-    return `Invalid input model: ${input_model}. Please select an active model.`;
+/**
+ * Validate the tenant's chosen AI models against the catalog: each must be
+ * active, approved, priced and purpose/modality compatible.
+ *
+ * @param {object} settings - the ai_settings object being saved
+ * @param {string|null} tenantId
+ * @param {boolean} [checkCredentialAccess=false] - also probe the effective
+ *   credential live (only for the dedicated AI-settings save, where the tenant
+ *   and its key already exist; skipped during tenant create/update).
+ */
+const validateAiModelSelections = async (settings, tenantId = null, checkCredentialAccess = false) => {
+  if (!settings) return null;
+  try {
+    for (const purpose of ["input", "output", "vision"]) {
+      const keys = [purpose === "vision" ? "vision_model" : `${purpose}_model`, `${purpose}_fallback_model`];
+      for (const key of keys) {
+        if (settings[key]) {
+          await eligibleModel(settings[key], purpose, tenantId, { skipAccessCheck: !checkCredentialAccess });
+        }
+      }
+    }
+    return null;
+  } catch (error) {
+    return error?.statusCode ? error.message : "Unable to validate the selected AI model.";
   }
-
-  if (output_model && !validModels.has(output_model)) {
-    return `Invalid output model: ${output_model}. Please select an active model.`;
-  }
-
-  return null;
 };
 
 export const createTenantController = async (req, res) => {
@@ -202,7 +206,7 @@ export const createTenantController = async (req, res) => {
     const normalizedMobile = normalizeMobile(cleanedCC, owner_mobile);
     const trimmedEmail = owner_email?.trim()?.toLowerCase();
 
-    const aiModelValidationError = await validateAiModelSelections(ai_settings);
+    const aiModelValidationError = await validateAiModelSelections(ai_settings, tenant_id);
     if (aiModelValidationError) {
       return res.status(400).json({ message: aiModelValidationError });
     }
@@ -414,7 +418,7 @@ export const updateTenantController = async (req, res) => {
       `[UPDATE TENANT] ID: ${id}, New Email: ${trimmedEmail}, Old Email: ${tenant.owner_email}`,
     );
 
-    const aiModelValidationError = await validateAiModelSelections(ai_settings);
+    const aiModelValidationError = await validateAiModelSelections(ai_settings, id);
     if (aiModelValidationError) {
       return res.status(400).json({ message: aiModelValidationError });
     }
@@ -803,8 +807,9 @@ export const updateTenantAiSettingsController = async (req, res) => {
     const tenant_id = req.user.tenant_id;
     const { ai_settings } = req.body;
 
-    // Validate model selections if provided
-    const aiModelValidationError = await validateAiModelSelections(ai_settings);
+    // Validate model selections if provided — this is the dedicated AI-settings
+    // save, so also confirm the effective credential can reach the model.
+    const aiModelValidationError = await validateAiModelSelections(ai_settings, tenant_id, true);
     if (aiModelValidationError) {
       return res.status(400).json({
         message: aiModelValidationError,
@@ -829,6 +834,7 @@ export const updateTenantAiSettingsController = async (req, res) => {
     }
 
     await updateTenantAiSettingsService(tenant_id, ai_settings);
+    invalidateOpenAIClient(tenant_id);
 
     // Return refreshed settings with masked key so frontend cache stays consistent
     const refreshed = await getTenantSettingsService(tenant_id);
