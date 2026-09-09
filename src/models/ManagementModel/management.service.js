@@ -390,40 +390,57 @@ export const getAiPricingRulesService = async () => {
   }
 };
 
+const auditAiPricing = (actor, action, model, before, after, transaction) =>
+  db.AdminAuditLog.create({
+    admin_id: String(actor || "system"),
+    action_type: "pricing_update",
+    details: { area: "ai_pricing", action, model },
+    before_state: before || null,
+    after_state: after || null,
+    reason: "AI model pricing administration",
+  }, transaction ? { transaction } : {});
+
 export const createAiPricingRuleService = async (
   model, input_rate, output_rate, markup_percent = 0, usd_to_inr_rate = DEFAULT_USD_TO_INR,
   description = null, recommended_for = "both", category = "mid-tier", cached_input_price_per_million = null,
+  actor = null,
 ) => {
   const data = { model, input_rate, output_rate, markup_percent, usd_to_inr_rate, description, recommended_for, category, cached_input_price_per_million, pricing_version: 1, is_active: false };
   validatePricing(data);
   if (!await db.AiModelCatalog.findOne({ where: { model, provider: "openai" } })) throw new ModelConfigurationError("Discover the model in the catalog before configuring pricing.");
   if (await db.AiPricing.findOne({ where: { model } })) throw new ModelConfigurationError("Pricing already exists for this exact model.");
   const rule = await db.AiPricing.create(data);
+  await auditAiPricing(actor, "create", model, null, rule.toJSON());
   invalidateCatalogCaches();
   return rule;
 };
 
-export const updateAiPricingRuleService = async (id, data) => {
+export const updateAiPricingRuleService = async (id, data, actor = null) => {
   if (data.is_active !== undefined && data.is_active !== false) throw new ModelConfigurationError("Use the catalog activation action after review and testing.");
   const result = await db.sequelize.transaction(async transaction => {
     const rule = await db.AiPricing.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
     if (!rule) throw new ModelConfigurationError("AI pricing rule not found.");
+    const before = rule.toJSON();
     const fields = ["input_rate", "output_rate", "cached_input_price_per_million", "markup_percent", "usd_to_inr_rate", "description", "recommended_for", "category", "is_active"];
     const update = Object.fromEntries(fields.filter(field => data[field] !== undefined).map(field => [field, data[field]]));
-    validatePricing({ ...rule.toJSON(), ...update });
+    validatePricing({ ...before, ...update });
     const billable = ["input_rate", "output_rate", "cached_input_price_per_million", "markup_percent", "usd_to_inr_rate"];
     if (billable.some(field => data[field] !== undefined && String(data[field]) !== String(rule[field]))) update.pricing_version = Number(rule.pricing_version) + 1;
     await rule.update(update, { transaction });
+    await auditAiPricing(actor, "update", rule.model, before, rule.toJSON(), transaction);
     return rule;
   });
   invalidateCatalogCaches();
   return result;
 };
 
-export const deleteAiPricingRuleService = async id => {
+export const deleteAiPricingRuleService = async (id, actor = null) => {
   const rule = await db.AiPricing.findByPk(id);
   if (!rule) throw new ModelConfigurationError("AI pricing rule not found.");
+  // Never physically delete a rule referenced by usage/ledger history — archive it.
+  const before = rule.toJSON();
   await rule.update({ is_active: false });
+  await auditAiPricing(actor, "archive", rule.model, before, rule.toJSON());
   invalidateCatalogCaches();
   return { deleted: false, archived: true };
 };

@@ -1,30 +1,56 @@
-import { resolveModel } from "./modelRuntime.js";
-import { executeModel } from "./modelExecutor.js";
-import { ModelConfigurationError, matchesApprovedModel } from "./modelProfile.js";
-import { trackAiTokenUsage } from "./trackAiTokenUsage.js";
-import { recordHealthEvent } from "../billing/billingHealthMonitor.js";
+import { resolveModel as defaultResolveModel } from "./modelRuntime.js";
+import { executeModel as defaultExecuteModel, requestByteSize } from "./modelExecutor.js";
+import { ModelConfigurationError, assertBillingReadiness, classifyBillingOutcome } from "./modelProfile.js";
+import { trackAiTokenUsage as defaultTrackAiTokenUsage } from "./trackAiTokenUsage.js";
+import { recordBillingReconciliation as defaultRecordBillingReconciliation } from "../billing/billingHealthMonitor.js";
 
 /**
  * Resolve → execute → normalize → bill, preserving the outward callAI() contract.
- * Pricing eligibility is checked (in resolveModel) BEFORE the provider request.
+ * Pricing eligibility AND tariff readiness are checked (in resolveModel) BEFORE
+ * the provider request. Deps are injectable for tests.
  */
-export async function runApprovedModel({ tenantId, purpose, source, ...options }) {
+export async function runApprovedModel({ tenantId, purpose, source, ...options }, deps = {}) {
+  const {
+    resolveModel = defaultResolveModel,
+    executeModel = defaultExecuteModel,
+    trackAiTokenUsage = defaultTrackAiTokenUsage,
+    recordBillingReconciliation = defaultRecordBillingReconciliation,
+  } = deps;
+
   const resolved = await resolveModel(tenantId, purpose);
+
+  // Preflight the tariff again with the concrete request in hand.
+  assertBillingReadiness(resolved.profile, resolved.pricing);
+
   const result = await executeModel(resolved.client, { ...options, model: resolved.model, profile: resolved.profile });
   const usage = result.usage;
-  const supportedTier = !result.rawResponse?.service_tier || result.rawResponse.service_tier === "default";
-  const modelMatches = matchesApprovedModel(resolved.profile, result.actualModel);
+  const requestBytes = requestByteSize(options.messages);
 
-  // Safety: if the returned model, tariff tier, or token volume cannot be mapped
-  // to the approved standard-tariff pricing rule, do NOT charge the wallet.
-  // Record the discrepancy for manual reconciliation and fail the request.
-  if (!modelMatches || !supportedTier || usage.inputTokens > resolved.profile.maxInputTokens || (usage.cachedInputTokens && resolved.pricing.cached_input_price_per_million == null)) {
+  // Post-response safety: only usage dimensions that could not be known before
+  // the call are judged here. If the response cannot be mapped to the approved
+  // standard-tariff pricing rule, do NOT charge the wallet — record a
+  // reconciliation event with everything an operator needs and fail the request.
+  const outcome = classifyBillingOutcome({
+    profile: resolved.profile,
+    price: resolved.pricing,
+    usage,
+    actualModel: result.actualModel,
+    serviceTier: result.rawResponse?.service_tier ?? null,
+    requestBytes,
+  });
+
+  if (!outcome.chargeable) {
     if (tenantId) {
-      await recordHealthEvent("billing_failure", tenantId, "AI response requires pricing reconciliation; no wallet charge applied.", {
-        source, requested_model: resolved.model, actual_model: result.actualModel,
-        pricing_rule_id: resolved.pricing.id, pricing_version: resolved.pricing.pricing_version,
-        endpoint: result.endpoint, usage,
-        reason: !modelMatches ? "unmapped_actual_model" : !supportedTier ? "unsupported_service_tier" : usage.inputTokens > resolved.profile.maxInputTokens ? "input_over_standard_tariff" : "cached_input_unpriced",
+      await recordBillingReconciliation({
+        tenantId, source, reason: outcome.reason,
+        requestedModel: resolved.model,
+        actualModel: result.actualModel,
+        actualModelMapping: outcome.mapping.matched || null,
+        pricingRuleId: resolved.pricing.id,
+        pricingVersion: resolved.pricing.pricing_version,
+        endpoint: result.endpoint,
+        serviceTier: result.rawResponse?.service_tier ?? null,
+        usage,
       }).catch(() => {});
     }
     throw new ModelConfigurationError("AI usage requires tariff reconciliation.", "AI_BILLING_RECONCILIATION", 502);
@@ -36,6 +62,7 @@ export async function runApprovedModel({ tenantId, purpose, source, ...options }
       pricing: resolved.pricing,
       requestedModel: resolved.requestedModel,
       actualModel: result.actualModel,
+      actualModelMapping: outcome.mapping.matched,
       endpoint: result.endpoint,
       fallbackReason: resolved.fallbackReason,
       usage,

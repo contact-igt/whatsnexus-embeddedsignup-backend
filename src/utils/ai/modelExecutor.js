@@ -1,22 +1,35 @@
-import { ModelConfigurationError, normalizeUsage, validateRequestProfile, validateModelId } from "./modelProfile.js";
+import { ModelConfigurationError, normalizeUsage, validateRequestProfile, validateModelId, billingCapabilities } from "./modelProfile.js";
+
+// Serialized-request byte ceiling. This is a coarse safety cap, NOT a token
+// count — bytes ≈ 3-4x tokens for English, so byte-bounding at the reviewed
+// value is deliberately conservative. maxOutputTokens IS a real token count.
+export function requestByteSize(messages) {
+  return Buffer.byteLength(JSON.stringify(messages ?? []), "utf8");
+}
 
 export function buildModelRequest({ model, profile, messages, maxTokens, temperature, topP, responseFormat }) {
   validateModelId(model);
   profile = validateRequestProfile(profile);
+  const caps = billingCapabilities(profile);
   if (!Array.isArray(messages) || !messages.length) throw new ModelConfigurationError("Messages are required.");
   if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > profile.maxOutputTokens) throw new ModelConfigurationError("Output token budget exceeds the approved profile.");
   const serialized = JSON.stringify(messages);
-  // Conservative byte bound: do not send text that could exceed the reviewed standard tariff.
-  const textMessages = messages.map(message => ({ ...message, content: typeof message.content === "string" ? message.content : message.content?.filter(part => part.type === "text") }));
-  if (Buffer.byteLength(JSON.stringify(textMessages), "utf8") + maxTokens > profile.maxInputTokens) throw new ModelConfigurationError("Request exceeds the approved standard-tariff budget.", "AI_TARIFF_UNSUPPORTED");
+  if (requestByteSize(messages) > profile.maxInputBytes) throw new ModelConfigurationError("Request exceeds the approved maxInputBytes ceiling.", "AI_REQUEST_TOO_LARGE");
   if (serialized.includes('"image_url"') && !profile.modalities.includes("image_input")) throw new ModelConfigurationError("Image input is not approved.");
+
+  // Sampling params: sent ONLY when the reviewed profile allows them. A caller
+  // default (e.g. callAI's temperature: 0.01) is dropped, not an error, for a
+  // model that doesn't accept it.
   const params = { model, [profile.tokenLimitParameter]: maxTokens };
   if (profile.supportsTemperature && temperature !== undefined) params.temperature = temperature;
   if (profile.supportsTopP && topP !== undefined) params.top_p = topP;
+
+  // Genuinely incompatible combinations — rejected before the provider call.
   if (responseFormat) {
+    if (!["json_object", "json_schema"].includes(responseFormat.type)) throw new ModelConfigurationError("Unsupported response format.");
     if (responseFormat.type === "json_object" && !profile.supportsJsonMode) throw new ModelConfigurationError("JSON mode is not approved.");
     if (responseFormat.type === "json_schema" && !profile.supportsStructuredOutput) throw new ModelConfigurationError("Structured output is not approved.");
-    if (!["json_object", "json_schema"].includes(responseFormat.type)) throw new ModelConfigurationError("Unsupported response format.");
+    if (responseFormat.type === "json_schema" && (!responseFormat.json_schema || typeof responseFormat.json_schema !== "object")) throw new ModelConfigurationError("json_schema payload is required for structured output.");
   }
   if (profile.endpoint === "chat_completions") {
     params.messages = messages;
@@ -36,8 +49,10 @@ export function buildModelRequest({ model, profile, messages, maxTokens, tempera
     if (profile.supportsReasoning) params.reasoning = { effort: profile.defaultReasoningEffort };
     if (responseFormat) params.text = { format: responseFormat.type === "json_schema" ? { type: "json_schema", ...responseFormat.json_schema } : responseFormat };
   }
-  // Explicitly choose the standard tier; no batch, tools, audio, or cache writes are requested.
-  params.service_tier = "default";
+  // Only pin the service tier when the reviewed profile opts in; otherwise let
+  // the provider apply its own default. Never request batch / tools / audio /
+  // cache-write tiers — those are not priced.
+  if (caps.serviceTier) params.service_tier = "default";
   return params;
 }
 

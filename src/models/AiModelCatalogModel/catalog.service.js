@@ -29,24 +29,59 @@ export async function listCatalog() {
   const pricingMap = new Map(prices.map(price => [price.model, price]));
   const entries = models.map(model => {
     const pricing = pricingMap.get(model.model) || null;
-    const blockers = activationBlockers(model, pricing);
+    // "blockers" = what stops a FRESH activation (needs a real passed test).
+    const blockers = activationBlockers(model, pricing, { forActivation: true });
+    // "runtimeBlockers" = what would stop a model that is already active
+    // (legacy_grandfathered is acceptable here).
+    const runtimeBlockers = activationBlockers(model, pricing, { forActivation: false });
     const active = !!pricing?.is_active;
-    const state = model.review_status === "retired" ? "Retired" : model.review_status === "unsupported" ? "Unsupported" : model.lifecycle_status === "shutdown" ? "Unavailable" : model.review_status !== "approved" ? "Pending review" : !pricing ? "Pricing needed" : model.test_status !== "passed" ? "Test required" : blockers.length ? "Unavailable" : active ? "Active" : "Ready to activate";
-    return { ...model, request_profile: parseProfile(model.request_profile), pricing, active, blockers, activationReady: !blockers.length, state };
+    const legacy = model.test_status === "legacy_grandfathered";
+    const state =
+      model.review_status === "retired" ? "Retired"
+      : model.review_status === "unsupported" ? "Unsupported"
+      : model.lifecycle_status === "shutdown" ? "Unavailable"
+      : model.review_status !== "approved" ? "Pending review"
+      : !pricing ? "Pricing needed"
+      : active && legacy ? "Active (legacy — not live-tested)"
+      : active && !runtimeBlockers.length ? "Active"
+      : model.test_status === "failed" ? "Test failed"
+      : model.test_status !== "passed" ? "Test required"
+      : blockers.length ? "Unavailable"
+      : "Ready to activate";
+    return {
+      ...model,
+      request_profile: parseProfile(model.request_profile),
+      pricing, active, blockers, runtimeBlockers,
+      activationReady: !blockers.length,
+      is_legacy_grandfathered: legacy,
+      state,
+    };
   });
   return { models: entries, latestSync, latestSuccess, uncataloguedActiveModels: prices.filter(price => price.is_active && !models.some(model => model.model === price.model)).map(price => price.model) };
 }
 
-// Use one dedicated MySQL connection: advisory locks belong to connections, not transactions.
+// Cross-instance mutual exclusion for catalog sync. Uses a MySQL advisory lock,
+// which is bound to the CONNECTION (not a transaction), so we hold one dedicated
+// connection for the whole sync and release the lock + connection in `finally`.
+const SYNC_LOCK_NAME = "whatsnexus_ai_model_catalog_sync";
+const SYNC_LOCK_TIMEOUT_SECONDS = 3; // bounded — brief overlaps wait, real overlaps get AI_SYNC_BUSY
+
 export async function syncCatalog() {
   const connection = await db.sequelize.connectionManager.getConnection();
   const query = (sql, values = []) => new Promise((resolve, reject) => connection.query(sql, values, (error, rows) => error ? reject(error) : resolve(rows)));
   let locked = false;
   let record;
   try {
-    const rows = await query("SELECT GET_LOCK('whatsnexus_ai_model_catalog_sync', 0) AS acquired");
-    locked = Number(rows[0]?.acquired) === 1;
-    if (!locked) throw new ModelConfigurationError("Catalog refresh is already running.", "AI_SYNC_BUSY", 409);
+    // GET_LOCK returns 1 (acquired), 0 (timed out — someone else holds it), or NULL (error).
+    const rows = await query("SELECT GET_LOCK(?, ?) AS acquired", [SYNC_LOCK_NAME, SYNC_LOCK_TIMEOUT_SECONDS]);
+    const acquired = rows?.[0]?.acquired;
+    locked = Number(acquired) === 1;
+    if (!locked) {
+      throw new ModelConfigurationError(
+        acquired == null ? "Could not acquire the catalog sync lock." : "Catalog refresh is already running.",
+        "AI_SYNC_BUSY", 409,
+      );
+    }
     record = await db.AiModelSync.create({ started_at: new Date(), status: "running" });
     const client = await getOpenAIClient();
     let page = await client.models.list({ timeout: 30000, maxRetries: 0 });
@@ -86,7 +121,13 @@ export async function syncCatalog() {
     }
     throw error;
   } finally {
-    if (locked) await query("SELECT RELEASE_LOCK('whatsnexus_ai_model_catalog_sync')");
+    try {
+      if (locked) await query("SELECT RELEASE_LOCK(?)", [SYNC_LOCK_NAME]);
+    } catch (releaseErr) {
+      // The lock is also freed automatically when this connection closes/returns.
+      // eslint-disable-next-line no-console
+      console.error("[AI-CATALOG-SYNC] RELEASE_LOCK failed:", releaseErr.message);
+    }
     await db.sequelize.connectionManager.releaseConnection(connection);
   }
 }
@@ -100,7 +141,14 @@ export async function reviewCatalog(id, data, actor) {
     const entry = await db.AiModelCatalog.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
     if (!entry) throw new ModelConfigurationError("Model not found.", "NOT_FOUND", 404);
     if (data.request_profile || data.review_status === "approved") validateRequestProfile(data.request_profile || entry.request_profile);
-    await entry.update({ ...data, reviewed_at: new Date(), reviewed_by: String(actor), test_status: "not_tested", test_result: null, test_error: null }, { transaction });
+    // A real profile change invalidates any prior test. Changing only
+    // review/lifecycle status keeps the existing compatibility status so an
+    // in-use legacy_grandfathered model does not suddenly fail runtime checks.
+    const profileChanged = data.request_profile !== undefined
+      && JSON.stringify(parseProfile(data.request_profile)) !== JSON.stringify(parseProfile(entry.request_profile));
+    const patch = { ...data, reviewed_at: new Date(), reviewed_by: String(actor) };
+    if (profileChanged) { patch.test_status = "not_tested"; patch.test_result = null; patch.test_error = null; }
+    await entry.update(patch, { transaction });
     await audit(actor, "review", entry.model, transaction);
   });
   invalidateCatalogCaches();
@@ -150,22 +198,18 @@ export async function activateCatalog(id, active, actor) {
     if (!entry) throw new ModelConfigurationError("Model not found.");
     const price = await db.AiPricing.findOne({ where: { model: entry.model }, transaction, lock: transaction.LOCK.UPDATE });
     if (active) {
-      const blockers = activationBlockers(entry, price);
+      // forActivation:true — a real passed live test is required. A
+      // legacy_grandfathered model cannot be (re)activated from here; run the
+      // compatibility test first.
+      const blockers = activationBlockers(entry, price, { forActivation: true });
       if (blockers.length) throw new ModelConfigurationError(blockers.join(" "));
       const test = typeof entry.test_result === "string"
         ? (() => { try { return JSON.parse(entry.test_result); } catch { return null; } })()
         : entry.test_result;
-      // Models grandfathered from pre-existing production pricing carry a
-      // synthetic pass; they need no fresh live credential probe here (the
-      // runtime still confirms access per request).
-      if (test?.grandfathered) {
-        // nothing extra to check
-      } else {
-        if (!test?.credentialScope) throw new ModelConfigurationError("Run a compatibility test before activating.");
-        const client = await getOpenAIClient(test.tenantId || null);
-        if (credentialFingerprint(client) !== test.credentialFingerprint) throw new ModelConfigurationError("Credential changed; repeat the compatibility test.");
-        await confirmModelAccess(client, test.tenantId, entry.model, true);
-      }
+      if (!test?.credentialScope) throw new ModelConfigurationError("Run a compatibility test before activating.");
+      const client = await getOpenAIClient(test.tenantId || null);
+      if (credentialFingerprint(client) !== test.credentialFingerprint) throw new ModelConfigurationError("Credential changed; repeat the compatibility test.");
+      await confirmModelAccess(client, test.tenantId, entry.model, true);
     }
     if (price) await price.update({ is_active: active }, { transaction });
     await entry.update({ activated_at: active ? new Date() : null, activated_by: String(actor) }, { transaction });

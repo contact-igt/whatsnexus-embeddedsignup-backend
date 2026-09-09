@@ -835,6 +835,7 @@ export const createAiPricingRuleController = async (req, res) => {
       finalRecommendedFor,
       finalCategory,
       req.body.cached_input_price_per_million ?? null,
+      req.user?.management_id || req.user?.unique_id || req.user?.id || null,
     );
     return res
       .status(201)
@@ -918,7 +919,7 @@ export const updateAiPricingRuleController = async (req, res) => {
         category !== undefined && VALID_CATEGORY.includes(category)
           ? category
           : undefined,
-    });
+    }, req.user?.management_id || req.user?.unique_id || req.user?.id || null);
     return res
       .status(200)
       .json({ success: true, message: "AI pricing rule updated", data: rule });
@@ -930,10 +931,10 @@ export const updateAiPricingRuleController = async (req, res) => {
 export const deleteAiPricingRuleController = async (req, res) => {
   try {
     const { id } = req.params;
-    await deleteAiPricingRuleService(id);
+    await deleteAiPricingRuleService(id, req.user?.management_id || req.user?.unique_id || req.user?.id || null);
     return res
       .status(200)
-      .json({ success: true, message: "AI pricing rule deleted" });
+      .json({ success: true, message: "AI pricing rule archived" });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }

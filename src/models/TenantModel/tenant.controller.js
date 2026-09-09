@@ -109,11 +109,22 @@ const validatePlanIdExists = async (plan_id) => {
 const validateAiModelSelections = async (settings, tenantId = null, checkCredentialAccess = false) => {
   if (!settings) return null;
   try {
+    // A model the tenant is NOT already on must have a real passed live test.
+    // Keeping an existing legacy_grandfathered selection is allowed.
+    let current = {};
+    if (tenantId) {
+      const tenant = await db.Tenants.findOne({ where: { tenant_id: tenantId, is_deleted: false }, attributes: ["ai_settings"], raw: true });
+      current = typeof tenant?.ai_settings === "string" ? JSON.parse(tenant.ai_settings || "{}") : (tenant?.ai_settings || {});
+    }
     for (const purpose of ["input", "output", "vision"]) {
       const keys = [purpose === "vision" ? "vision_model" : `${purpose}_model`, `${purpose}_fallback_model`];
       for (const key of keys) {
         if (settings[key]) {
-          await eligibleModel(settings[key], purpose, tenantId, { skipAccessCheck: !checkCredentialAccess });
+          const isUnchanged = current[key] === settings[key];
+          await eligibleModel(settings[key], purpose, tenantId, {
+            skipAccessCheck: !checkCredentialAccess,
+            requireLiveTest: !isUnchanged,
+          });
         }
       }
     }

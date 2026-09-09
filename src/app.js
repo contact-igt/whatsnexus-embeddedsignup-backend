@@ -210,10 +210,21 @@ app.use((err, req, res, next) => {
 {
   const MAX_RETRIES = 5;
   const RETRY_DELAY_MS = 3000;
+  // Auto schema-alter at startup is a development convenience. In production the
+  // schema is owned by explicit migrations; set DB_AUTO_MIGRATE=true only to
+  // deliberately re-enable it there.
+  const isProd = (process.env.NODE_ENV || "").toLowerCase() === "production";
+  const autoMigrate = process.env.DB_AUTO_MIGRATE === "true" || (!isProd && process.env.DB_AUTO_MIGRATE !== "false");
   let lastErr;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      await db.sequelize.sync({ alter: true });
+      if (autoMigrate) {
+        await db.sequelize.sync({ alter: true });
+      } else {
+        await db.sequelize.authenticate();
+        const { assertCatalogSchema } = await import("./utils/ai/catalogSchemaPreflight.js");
+        await assertCatalogSchema(db, { fatal: true });
+      }
 
       const [, cleanupMeta] = await db.sequelize.query(
         `UPDATE ${tableNames.TENANT_USERS}

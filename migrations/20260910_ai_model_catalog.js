@@ -13,6 +13,9 @@ import { pathToFileURL } from "node:url";
 // production. Anything not listed stays pending and cannot execute until an
 // admin reviews it through the catalog UI.
 const CHAT = "chat_completions";
+// billingCapabilities.cachedInput stays false here; the backfill script flips it
+// once a verified cached rate is on the pricing row.
+const CAPS = { standardInput: true, cachedInput: false, standardOutput: true, longContext: false, cacheWrite: false, tools: false, serviceTier: false };
 const base = (over = {}) => ({
   endpoint: CHAT, usageFormat: CHAT,
   modalities: ["text"], purposes: ["output"],
@@ -20,25 +23,26 @@ const base = (over = {}) => ({
   supportsTemperature: true, supportsTopP: true,
   supportsReasoning: false, reasoningEfforts: [],
   tokenLimitParameter: "max_tokens",
-  maxInputTokens: 500000, maxOutputTokens: 8000,
+  maxInputBytes: 2000000, maxOutputTokens: 8000,
   allowVersionedActuals: true,
+  billingCapabilities: { ...CAPS },
   ...over,
 });
 const reasoning = (over = {}) => base({
   supportsTemperature: false, supportsTopP: false,
   supportsReasoning: true, reasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "medium",
   tokenLimitParameter: "max_completion_tokens",
-  maxInputTokens: 300000, maxOutputTokens: 32000,
+  maxInputBytes: 1200000, maxOutputTokens: 32000,
   ...over,
 });
 const vision = ["text", "image_input"];
 
 const GRANDFATHER_PROFILES = {
-  "gpt-4o": base({ modalities: vision, purposes: ["input", "output", "vision"], maxInputTokens: 500000, actualModelIds: ["gpt-4o", "gpt-4o-2024-11-20", "gpt-4o-2024-08-06", "gpt-4o-2024-05-13"] }),
+  "gpt-4o": base({ modalities: vision, purposes: ["input", "output", "vision"], actualModelIds: ["gpt-4o", "gpt-4o-2024-11-20", "gpt-4o-2024-08-06", "gpt-4o-2024-05-13"] }),
   "gpt-4o-mini": base({ modalities: vision, purposes: ["input", "output", "vision"], actualModelIds: ["gpt-4o-mini", "gpt-4o-mini-2024-07-18"] }),
-  "gpt-4.1": base({ modalities: vision, purposes: ["input", "output", "vision"], maxInputTokens: 1000000, actualModelIds: ["gpt-4.1", "gpt-4.1-2025-04-14"] }),
-  "gpt-4.1-mini": base({ modalities: vision, purposes: ["input", "output", "vision"], maxInputTokens: 1000000, actualModelIds: ["gpt-4.1-mini", "gpt-4.1-mini-2025-04-14"] }),
-  "gpt-4.1-nano": base({ modalities: vision, purposes: ["input"], maxInputTokens: 1000000, actualModelIds: ["gpt-4.1-nano", "gpt-4.1-nano-2025-04-14"] }),
+  "gpt-4.1": base({ modalities: vision, purposes: ["input", "output", "vision"], maxInputBytes: 4000000, actualModelIds: ["gpt-4.1", "gpt-4.1-2025-04-14"] }),
+  "gpt-4.1-mini": base({ modalities: vision, purposes: ["input", "output", "vision"], maxInputBytes: 4000000, actualModelIds: ["gpt-4.1-mini", "gpt-4.1-mini-2025-04-14"] }),
+  "gpt-4.1-nano": base({ modalities: vision, purposes: ["input"], maxInputBytes: 4000000, actualModelIds: ["gpt-4.1-nano", "gpt-4.1-nano-2025-04-14"] }),
   "gpt-5.4": base({ modalities: vision, purposes: ["output", "vision"], actualModelIds: ["gpt-5.4"] }),
   "gpt-5.4-mini": base({ modalities: vision, purposes: ["input", "output", "vision"], actualModelIds: ["gpt-5.4-mini"] }),
   "gpt-5.4-nano": base({ purposes: ["input"], actualModelIds: ["gpt-5.4-nano"] }),
@@ -105,9 +109,11 @@ export async function up(db) {
       request_profile: profile,
       reviewed_at: now,
       reviewed_by: "system-grandfather",
-      test_status: "passed",
-      last_tested_at: now,
-      test_result: { grandfathered: true, note: `Adopted from pre-existing active AiPricing on ${now.toISOString()}` },
+      // Not a live test — existing tenants keep running; a fresh activation or a
+      // new tenant assignment still requires a real passed compatibility test.
+      test_status: "legacy_grandfathered",
+      last_tested_at: null,
+      test_result: { grandfathered: true, status: "legacy_grandfathered", note: `Adopted from pre-existing active AiPricing on ${now.toISOString()}` },
       activated_at: now,
       activated_by: "system-grandfather",
     });

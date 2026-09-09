@@ -26,9 +26,11 @@ const fallbackKey = purpose => `${purpose}_fallback_model`;
  * @param {object} [opts]
  * @param {import("openai").OpenAI} [opts.client] - reuse an already-built client
  * @param {boolean} [opts.skipAccessCheck] - skip the live credential probe (config-time validation only)
+ * @param {boolean} [opts.requireLiveTest] - reject a legacy_grandfathered model
+ *   (used when a tenant is choosing/reassigning a model, not for existing runtime)
  */
 export async function eligibleModel(model, purpose, tenantId, opts = {}) {
-  const { client: suppliedClient, skipAccessCheck = false } = opts;
+  const { client: suppliedClient, skipAccessCheck = false, requireLiveTest = false } = opts;
   validateModelId(model);
   if (!["input", "output", "vision"].includes(purpose)) throw new ModelConfigurationError("Invalid model purpose.");
   const [catalog, pricing] = await Promise.all([
@@ -36,7 +38,7 @@ export async function eligibleModel(model, purpose, tenantId, opts = {}) {
     db.AiPricing.findOne({ where: { model, is_active: true }, raw: true }),
   ]);
   if (!catalog || !pricing) throw new ModelConfigurationError("Model needs an approved catalog profile and active exact pricing.", "AI_MODEL_UNAVAILABLE", 409);
-  const blockers = activationBlockers(catalog, pricing);
+  const blockers = activationBlockers(catalog, pricing, { forActivation: requireLiveTest });
   if (blockers.length) throw new ModelConfigurationError(blockers.join(" "), "AI_MODEL_UNAVAILABLE", 409);
   const profile = validateRequestProfile(catalog.request_profile);
   if (!profile.purposes.includes(purpose)) throw new ModelConfigurationError("Model is not approved for this purpose.", "AI_MODEL_PURPOSE", 409);

@@ -14,28 +14,67 @@ export function validateModelId(model) {
 }
 
 const requiredBooleans = ["supportsStructuredOutput", "supportsJsonMode", "supportsTemperature", "supportsTopP", "supportsReasoning"];
-const fields = new Set(["endpoint", "modalities", "purposes", ...requiredBooleans, "reasoningEfforts", "tokenLimitParameter", "usageFormat", "defaultReasoningEffort", "maxInputTokens", "maxOutputTokens", "actualModelIds", "allowVersionedActuals"]);
+const fields = new Set([
+  "endpoint", "modalities", "purposes", ...requiredBooleans, "reasoningEfforts", "tokenLimitParameter",
+  "usageFormat", "defaultReasoningEffort", "maxInputBytes", "maxOutputTokens", "actualModelIds",
+  "allowVersionedActuals", "billingCapabilities",
+]);
 
-// Explicit, reviewed opt-in: OpenAI resolves an alias like "gpt-4o" to a dated
-// snapshot ("gpt-4o-2024-08-06") in response.model. When the reviewer sets
-// allowVersionedActuals, an actual model of the form "<approved>-<date/version>"
-// is accepted as the same model. This is an identity check only; billing still
-// uses the approved pricing row, never a prefix guess.
-// The remainder after "<approved>" must be exactly one version token, e.g.
-// "-2024-08-06", "-0125", "-latest". Anchored both ends so "gpt-4o" never
-// swallows "gpt-4o-mini-2024-07-18".
-const VERSION_SUFFIX = /^-(?:\d{4}-\d{2}-\d{2}|\d{4,}|latest)$/;
-export function matchesApprovedModel(profile, actualModel) {
-  if (typeof actualModel !== "string" || !actualModel) return false;
-  if (profile.actualModelIds.includes(actualModel)) return true;
-  if (!profile.allowVersionedActuals) return false;
-  return profile.actualModelIds.some(approved => VERSION_SUFFIX.test(actualModel.slice(approved.length)) && actualModel.slice(0, approved.length) === approved);
+// Which tariff dimensions this project can currently price. Only standardInput +
+// standardOutput are billable; cachedInput needs a reviewed cached rate on the
+// pricing row; serviceTier controls whether the "default" tier is requested
+// explicitly. longContext / cacheWrite / tools are NOT implemented and must
+// stay false — a profile may not claim them.
+const BILLING_CAP_KEYS = ["standardInput", "cachedInput", "standardOutput", "longContext", "cacheWrite", "tools", "serviceTier"];
+const UNSUPPORTED_TARIFFS = ["longContext", "cacheWrite", "tools"];
+export const DEFAULT_BILLING_CAPABILITIES = {
+  standardInput: true, cachedInput: false, standardOutput: true,
+  longContext: false, cacheWrite: false, tools: false, serviceTier: false,
+};
+
+export function billingCapabilities(profile) {
+  return { ...DEFAULT_BILLING_CAPABILITIES, ...(profile?.billingCapabilities || {}) };
 }
+
 const enumList = (values, allowed, label, allowEmpty = false) => {
   if (!Array.isArray(values) || (!allowEmpty && !values.length) || new Set(values).size !== values.length || values.some(value => !allowed.includes(value))) {
     throw new ModelConfigurationError(`Invalid ${label}. Allowed: ${allowed.join(", ")}.`);
   }
 };
+
+// Explicit, reviewed opt-in: OpenAI resolves an alias like "gpt-4o" to a dated
+// snapshot ("gpt-4o-2024-08-06") in response.model. When the reviewer sets
+// allowVersionedActuals, an actual model of the form "<approved>-<one version
+// token>" is accepted as the same model. This is an identity check only; billing
+// always uses the approved pricing row, never a prefix guess.
+// The remainder after "<approved>" must be exactly one version token, e.g.
+// "-2024-08-06", "-0125", "-latest". Anchored both ends so "gpt-4o" never
+// swallows "gpt-4o-mini-2024-07-18".
+const VERSION_SUFFIX = /^-(?:\d{4}-\d{2}-\d{2}|\d{4,}|latest)$/;
+
+export function matchesApprovedModel(profile, actualModel) {
+  return !!resolveApprovedModel(profile, actualModel).matched;
+}
+
+/**
+ * Resolve a provider-returned model id to exactly one approved id, or explain why not.
+ * @returns {{ matched: string|null, kind: "exact"|"versioned"|null, reason: string|null }}
+ */
+export function resolveApprovedModel(profile, actualModel) {
+  if (typeof actualModel !== "string" || !actualModel) return { matched: null, kind: null, reason: "empty or non-string model id" };
+  try { validateModelId(actualModel); } catch { return { matched: null, kind: null, reason: "malformed model id" }; }
+  const ids = profile?.actualModelIds || [];
+  if (ids.includes(actualModel)) return { matched: actualModel, kind: "exact", reason: null };
+  if (!profile?.allowVersionedActuals) return { matched: null, kind: null, reason: "no exact approved id; versioned matching disabled" };
+  const hits = ids.filter(approved =>
+    actualModel.length > approved.length &&
+    actualModel.slice(0, approved.length) === approved &&
+    VERSION_SUFFIX.test(actualModel.slice(approved.length)),
+  );
+  if (hits.length === 1) return { matched: hits[0], kind: "versioned", reason: null };
+  if (hits.length > 1) return { matched: null, kind: null, reason: `ambiguous: matches ${hits.join(", ")}` };
+  return { matched: null, kind: null, reason: "no exact or versioned approved id" };
+}
 
 export function validateRequestProfile(profile) {
   // Some MySQL/MariaDB setups return JSON columns as strings (esp. with raw:true).
@@ -58,12 +97,22 @@ export function validateRequestProfile(profile) {
   const limits = profile.endpoint === "responses" ? ["max_output_tokens"] : ["max_tokens", "max_completion_tokens"];
   if (!limits.includes(profile.tokenLimitParameter)) throw new ModelConfigurationError("Token limit parameter does not match the endpoint.");
   if (profile.supportsReasoning && profile.tokenLimitParameter === "max_tokens") throw new ModelConfigurationError("Reasoning profiles require a completion/output token limit.");
-  for (const field of ["maxInputTokens", "maxOutputTokens"]) {
-    if (!Number.isSafeInteger(profile[field]) || profile[field] < 1 || profile[field] > 1000000) throw new ModelConfigurationError(`${field} must be a positive integer at most 1000000; use the standard-tariff limit.`);
-  }
+  // maxInputBytes: a serialized-request byte ceiling (NOT a token count). maxOutputTokens is a real token count.
+  if (!Number.isSafeInteger(profile.maxInputBytes) || profile.maxInputBytes < 1 || profile.maxInputBytes > 8_000_000) throw new ModelConfigurationError("maxInputBytes must be a positive integer up to 8000000 (serialized request bytes).");
+  if (!Number.isSafeInteger(profile.maxOutputTokens) || profile.maxOutputTokens < 1 || profile.maxOutputTokens > 1_000_000) throw new ModelConfigurationError("maxOutputTokens must be a positive integer at most 1000000.");
   if (!Array.isArray(profile.actualModelIds) || !profile.actualModelIds.length || profile.actualModelIds.length > 30) throw new ModelConfigurationError("List the exact approved returned model IDs in actualModelIds.");
   profile.actualModelIds.forEach(validateModelId);
+  if (new Set(profile.actualModelIds).size !== profile.actualModelIds.length) throw new ModelConfigurationError("actualModelIds must not contain duplicates.");
   if (profile.allowVersionedActuals !== undefined && typeof profile.allowVersionedActuals !== "boolean") throw new ModelConfigurationError("allowVersionedActuals must be a boolean.");
+
+  if (profile.billingCapabilities !== undefined) {
+    const bc = profile.billingCapabilities;
+    if (!bc || typeof bc !== "object" || Array.isArray(bc)) throw new ModelConfigurationError("billingCapabilities must be an object.");
+    for (const key of Object.keys(bc)) if (!BILLING_CAP_KEYS.includes(key)) throw new ModelConfigurationError(`Unsupported billingCapabilities key: ${key}`);
+    for (const key of BILLING_CAP_KEYS) if (bc[key] !== undefined && typeof bc[key] !== "boolean") throw new ModelConfigurationError(`billingCapabilities.${key} must be a boolean.`);
+    if (bc.standardInput === false || bc.standardOutput === false) throw new ModelConfigurationError("standardInput and standardOutput billing must be enabled.");
+    for (const key of UNSUPPORTED_TARIFFS) if (bc[key] === true) throw new ModelConfigurationError(`billingCapabilities.${key} is not implemented — leave it false and keep requests on standard pricing.`);
+  }
   return profile;
 }
 
@@ -83,6 +132,50 @@ export function validatePricing(price) {
   return price;
 }
 
+// Service tiers that bill at the standard rate.
+const STANDARD_SERVICE_TIERS = new Set(["default", "auto", "standard", "", "null"]);
+
+/**
+ * POST-response decision: can this usage be charged against the approved
+ * standard-tariff pricing rule? Only dimensions that cannot be known before the
+ * call are judged here. Returns { chargeable, reason }.
+ */
+export function classifyBillingOutcome({ profile, price, usage, actualModel, serviceTier, requestBytes }) {
+  const mapping = resolveApprovedModel(profile, actualModel);
+  if (!mapping.matched) return { chargeable: false, reason: "unmapped_actual_model", mapping };
+  if (serviceTier != null && !STANDARD_SERVICE_TIERS.has(String(serviceTier).toLowerCase())) {
+    return { chargeable: false, reason: "unsupported_service_tier", mapping };
+  }
+  if ((usage.cachedInputTokens || 0) > 0 && price.cached_input_price_per_million == null) {
+    return { chargeable: false, reason: "cached_input_unpriced", mapping };
+  }
+  if (Number.isFinite(requestBytes) && Number.isFinite(profile.maxInputBytes) && requestBytes > profile.maxInputBytes) {
+    return { chargeable: false, reason: "request_over_max_bytes", mapping };
+  }
+  return { chargeable: true, reason: null, mapping };
+}
+
+/**
+ * Preflight, run BEFORE the provider request: every tariff the approved profile
+ * can produce must be priced on the selected rule. Throws a controlled
+ * ModelConfigurationError otherwise so no billable request is ever made against
+ * an incomplete pricing rule.
+ */
+export function assertBillingReadiness(profile, price) {
+  validatePricing(price);
+  const bc = billingCapabilities(profile);
+  if (bc.cachedInput && price.cached_input_price_per_million == null) {
+    throw new ModelConfigurationError(
+      "This model can return cached input tokens but the pricing rule has no cached-input rate. Backfill it before use.",
+      "AI_CACHED_PRICING_MISSING", 409,
+    );
+  }
+  for (const key of UNSUPPORTED_TARIFFS) {
+    if (bc[key]) throw new ModelConfigurationError(`Tariff "${key}" is not supported yet.`, "AI_TARIFF_UNSUPPORTED", 409);
+  }
+  return bc;
+}
+
 export function normalizeUsage(response, endpoint) {
   const usage = response?.usage;
   if (!usage) throw new ModelConfigurationError("Provider did not return usage.", "AI_USAGE_MISSING", 502);
@@ -95,7 +188,7 @@ export function normalizeUsage(response, endpoint) {
     outputTokens,
     reasoningTokens: (isChat ? usage.completion_tokens_details : usage.output_tokens_details)?.reasoning_tokens ?? 0,
     // Derive the total from the billable parts so a provider accounting change to
-    // total_tokens (e.g. adding a new sub-category) never blocks a real request.
+    // total_tokens (e.g. a new sub-category) never blocks a real request.
     totalTokens: Number.isSafeInteger(inputTokens) && Number.isSafeInteger(outputTokens) ? inputTokens + outputTokens : usage.total_tokens,
   };
   for (const [key, value] of Object.entries(result)) if (!Number.isSafeInteger(value) || value < 0) throw new ModelConfigurationError(`Invalid provider usage: ${key}`, "AI_USAGE_INVALID", 502);
@@ -106,7 +199,7 @@ export function normalizeUsage(response, endpoint) {
 export function calculateTokenCost(price, usage) {
   validatePricing(price);
   const cachedInputTokens = usage.cachedInputTokens || 0;
-  if (cachedInputTokens > 0 && price.cached_input_price_per_million == null) throw new ModelConfigurationError("Cached-input pricing is not approved.", "AI_TARIFF_UNSUPPORTED", 409);
+  if (cachedInputTokens > 0 && price.cached_input_price_per_million == null) throw new ModelConfigurationError("Cached-input pricing is not approved.", "AI_CACHED_PRICING_MISSING", 409);
   const uncachedInputTokens = Math.max(usage.inputTokens - cachedInputTokens, 0);
   const inputCost = (uncachedInputTokens / 1000000) * Number(price.input_rate);
   const cachedInputCost = (cachedInputTokens / 1000000) * Number(price.cached_input_price_per_million ?? 0);
@@ -115,12 +208,32 @@ export function calculateTokenCost(price, usage) {
   return { baseCostUsd, finalCostUsd: baseCostUsd * (1 + Number(price.markup_percent) / 100), inputCost, cachedInputCost, outputCost };
 }
 
-export function activationBlockers(catalog, price) {
+const ACTIVATABLE_TEST_STATUSES = new Set(["passed"]);
+const RUNTIME_OK_TEST_STATUSES = new Set(["passed", "legacy_grandfathered"]);
+export const CATALOG_TEST_STATUSES = ["not_tested", "passed", "failed", "legacy_grandfathered"];
+
+/**
+ * @param {object} catalog
+ * @param {object} price
+ * @param {object} [opts]
+ * @param {boolean} [opts.forActivation=true] - true = gating a fresh activation
+ *   (requires a real passed live test); false = runtime eligibility for a model
+ *   that is already active (legacy_grandfathered is acceptable).
+ */
+export function activationBlockers(catalog, price, opts = {}) {
+  const { forActivation = true } = opts;
   const blockers = [];
   if (catalog.review_status !== "approved") blockers.push("Model requires approval.");
   if (["shutdown", "unknown"].includes(catalog.lifecycle_status) || (catalog.shutdown_date && new Date(catalog.shutdown_date).getTime() <= Date.now())) blockers.push("Model availability is not confirmed or has ended.");
-  try { validateRequestProfile(catalog.request_profile); } catch (error) { blockers.push(error.message); }
+  let profile = null;
+  try { profile = validateRequestProfile(catalog.request_profile); } catch (error) { blockers.push(error.message); }
   try { validatePricing(price); } catch (error) { blockers.push(error.message); }
-  if (catalog.test_status !== "passed") blockers.push("A successful compatibility test is required.");
+  if (profile && price) {
+    try { assertBillingReadiness(profile, price); } catch (error) { blockers.push(error.message); }
+  }
+  const okStatuses = forActivation ? ACTIVATABLE_TEST_STATUSES : RUNTIME_OK_TEST_STATUSES;
+  if (!okStatuses.has(catalog.test_status)) {
+    blockers.push(forActivation ? "A successful live compatibility test is required." : "The model has no passing compatibility status.");
+  }
   return blockers;
 }
