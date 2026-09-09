@@ -141,7 +141,7 @@ test("runApprovedModel: preflight blocks when cached capability has no cached ra
         executeModel: async () => { executed = true; return {}; },
       },
     ),
-    (e) => e.code === "AI_CACHED_PRICING_MISSING",
+    (e) => e.code === "AI_TARIFF_UNSUPPORTED" && e.reason === "CACHED_INPUT_RATE_MISSING",
   );
   assert.equal(executed, false, "no provider request when the tariff is not ready");
 });

@@ -156,22 +156,48 @@ export function classifyBillingOutcome({ profile, price, usage, actualModel, ser
 }
 
 /**
- * Preflight, run BEFORE the provider request: every tariff the approved profile
- * can produce must be priced on the selected rule. Throws a controlled
- * ModelConfigurationError otherwise so no billable request is ever made against
- * an incomplete pricing rule.
+ * Preflight, run BEFORE the provider request. Every tariff the approved profile
+ * (or a known cache-capable model) can produce must be priced on the selected
+ * rule, or a controlled error is raised so no billable request is ever made
+ * against an incomplete pricing rule.
+ *
+ * This is one link in the chain:
+ *   eligibleModel / activationBlockers  -> approved | legacy runtime eligibility,
+ *                                          valid pricing version, exact pricing row
+ *   assertBillingReadiness (here)       -> standard in/out priced, cached priced
+ *                                          when caching may occur, no unsupported tariff
+ *   buildModelRequest                   -> supported input-size range
+ *   classifyBillingOutcome (post-call)  -> exact model mapping, supported service
+ *                                          tier, unexpected cached usage
+ *
+ * @param {object} profile - reviewed request profile
+ * @param {object} price    - active AiPricing row
+ * @param {object} [opts]
+ * @param {boolean} [opts.cacheCapable] - force the cached-rate requirement even
+ *   when billingCapabilities.cachedInput is false (the provider may still return
+ *   cached tokens). Defaults to the profile's cachedInput capability.
  */
-export function assertBillingReadiness(profile, price) {
-  validatePricing(price);
+export function assertBillingReadiness(profile, price, opts = {}) {
+  validatePricing(price); // rates finite/non-negative, valid pricing_version, category
+  if (price.is_active === false) {
+    throw new ModelConfigurationError("Pricing rule is not active.", "AI_TARIFF_UNSUPPORTED", 409);
+  }
   const bc = billingCapabilities(profile);
-  if (bc.cachedInput && price.cached_input_price_per_million == null) {
-    throw new ModelConfigurationError(
-      "This model can return cached input tokens but the pricing rule has no cached-input rate. Backfill it before use.",
-      "AI_CACHED_PRICING_MISSING", 409,
+  const cacheCapable = opts.cacheCapable === undefined ? bc.cachedInput : !!opts.cacheCapable;
+  if (cacheCapable && price.cached_input_price_per_million == null) {
+    const err = new ModelConfigurationError(
+      "This model's requests can be served partly from the provider cache, but its pricing rule has no cached-input rate.",
+      "AI_TARIFF_UNSUPPORTED", 409,
     );
+    err.reason = "CACHED_INPUT_RATE_MISSING"; // safe internal reason — never sent to a tenant
+    throw err;
   }
   for (const key of UNSUPPORTED_TARIFFS) {
-    if (bc[key]) throw new ModelConfigurationError(`Tariff "${key}" is not supported yet.`, "AI_TARIFF_UNSUPPORTED", 409);
+    if (bc[key]) {
+      const err = new ModelConfigurationError(`Tariff "${key}" is not supported yet.`, "AI_TARIFF_UNSUPPORTED", 409);
+      err.reason = `${key.toUpperCase()}_TARIFF_UNSUPPORTED`;
+      throw err;
+    }
   }
   return bc;
 }
@@ -199,7 +225,11 @@ export function normalizeUsage(response, endpoint) {
 export function calculateTokenCost(price, usage) {
   validatePricing(price);
   const cachedInputTokens = usage.cachedInputTokens || 0;
-  if (cachedInputTokens > 0 && price.cached_input_price_per_million == null) throw new ModelConfigurationError("Cached-input pricing is not approved.", "AI_CACHED_PRICING_MISSING", 409);
+  if (cachedInputTokens > 0 && price.cached_input_price_per_million == null) {
+    const err = new ModelConfigurationError("Cached-input pricing is not approved.", "AI_TARIFF_UNSUPPORTED", 409);
+    err.reason = "CACHED_INPUT_RATE_MISSING";
+    throw err;
+  }
   const uncachedInputTokens = Math.max(usage.inputTokens - cachedInputTokens, 0);
   const inputCost = (uncachedInputTokens / 1000000) * Number(price.input_rate);
   const cachedInputCost = (cachedInputTokens / 1000000) * Number(price.cached_input_price_per_million ?? 0);

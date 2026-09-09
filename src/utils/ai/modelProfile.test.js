@@ -80,7 +80,7 @@ test("assertBillingReadiness: cached-input requires a cached rate BEFORE the req
   assert.doesNotThrow(() => assertBillingReadiness(cachedProfile, validPrice()));
   assert.throws(
     () => assertBillingReadiness(cachedProfile, validPrice({ cached_input_price_per_million: null })),
-    (e) => e.code === "AI_CACHED_PRICING_MISSING",
+    (e) => e.code === "AI_TARIFF_UNSUPPORTED" && e.reason === "CACHED_INPUT_RATE_MISSING",
   );
   // profile that does not claim cachedInput is fine without a cached rate
   assert.doesNotThrow(() => assertBillingReadiness(chatProfile(), validPrice({ cached_input_price_per_million: null })));
@@ -139,7 +139,7 @@ test("calculateTokenCost: uncached/cached/output split + markup, blocks unpriced
   assert.equal(calculateTokenCost(validPrice(), { inputTokens: 100, cachedInputTokens: 0, outputTokens: 0 }).cachedInputCost, 0);
   assert.throws(
     () => calculateTokenCost(validPrice({ cached_input_price_per_million: null }), { inputTokens: 1000, cachedInputTokens: 200, outputTokens: 10 }),
-    (e) => e.code === "AI_CACHED_PRICING_MISSING",
+    (e) => e.code === "AI_TARIFF_UNSUPPORTED" && e.reason === "CACHED_INPUT_RATE_MISSING",
   );
   assert.doesNotThrow(() => calculateTokenCost(validPrice({ cached_input_price_per_million: null }), { inputTokens: 1000, cachedInputTokens: 0, outputTokens: 10 }));
 });

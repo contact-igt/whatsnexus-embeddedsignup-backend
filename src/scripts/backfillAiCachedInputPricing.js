@@ -1,99 +1,223 @@
 /**
- * Backfill verified cached-input rates onto active AiPricing rows and flip the
+ * Backfill reviewed cached-input rates onto ACTIVE AiPricing rows and flip the
  * matching catalog profile's billingCapabilities.cachedInput to true.
  *
- *   node src/scripts/backfillAiCachedInputPricing.js --dry-run
+ *   node src/scripts/backfillAiCachedInputPricing.js --dry-run          (default)
  *   node src/scripts/backfillAiCachedInputPricing.js --apply
+ *   node src/scripts/backfillAiCachedInputPricing.js --apply --resolve-conflicts
+ *   node src/scripts/backfillAiCachedInputPricing.js --apply --allow-production
  *
  * Rules:
+ *   - dry-run by default; --apply required for any write
  *   - rates come only from src/config/aiCachedInputPricing.js (reviewed config)
- *   - never overwrites an existing non-null cached-input rate
- *   - --apply required for any write; --dry-run just reports
- *   - increments pricing_version when a cached rate is added
- *   - historical AiTokenUsage / BillingLedger snapshots are never touched
- *   - unverified / unknown models are reported as blocked, not modified
+ *   - EXACT model-id match only — never prefix / family matching
+ *   - never overwrites an existing non-null cached rate unless --resolve-conflicts
+ *   - equal existing rate => skipped; differing existing rate => conflict
+ *   - pricing_version increments ONLY when a rate actually changes
+ *   - the whole --apply runs in ONE transaction and rolls back entirely on error
+ *   - writes an admin_audit_log row per changed rule (before/after state)
+ *   - historical ai_token_usage / billing_ledger rows are never touched
+ *   - refuses an unknown INVICTUS_SERVER_LINE; production needs --allow-production
+ *   - never logs credentials
  */
 import { pathToFileURL } from "node:url";
+import ServerEnvironmentConfig from "../config/server.config.js";
+import DatabaseEnvironmentConfig from "../config/database.config.js";
 import { CACHED_INPUT_PRICING_REVIEWED_ON, reviewedCachedRate } from "../config/aiCachedInputPricing.js";
 import { billingCapabilities } from "../utils/ai/modelProfile.js";
+
+const KNOWN_ENVIRONMENTS = ["production", "stage", "development", "local"];
+
+export function resolveEnvironment() {
+  const raw = (ServerEnvironmentConfig?.server?.line || "").trim();
+  const name = raw || "local";
+  if (raw && !KNOWN_ENVIRONMENTS.includes(raw)) {
+    throw new Error(`Unknown INVICTUS_SERVER_LINE "${raw}". Expected one of: ${KNOWN_ENVIRONMENTS.join(", ")}.`);
+  }
+  const dbCfg =
+    name === "production" ? DatabaseEnvironmentConfig.live
+    : name === "development" ? DatabaseEnvironmentConfig.development
+    : name === "stage" ? DatabaseEnvironmentConfig.stage
+    : DatabaseEnvironmentConfig.local;
+  return { name, database: dbCfg?.database || "(unknown)", host: dbCfg?.host || "(unknown)" };
+}
 
 const parseProfile = v => {
   if (v && typeof v === "object") return v;
   if (typeof v === "string") { try { return JSON.parse(v); } catch { return null; } }
   return null;
 };
+const eq = (a, b) => Number(a) === Number(b);
 
 /**
  * @param {object} opts
  * @param {import("../database/index.js").default} opts.db
  * @param {boolean} [opts.apply=false]
- * @returns {Promise<{ applied: Array, blocked: Array, skipped: Array, reviewedOn: string }>}
+ * @param {boolean} [opts.resolveConflicts=false]
+ * @param {string[]} [opts.models] - restrict to these EXACT active model ids
+ *   (operational: backfill one model; tests: only touch throwaway rows). When
+ *   omitted, every active pricing row is inspected.
  */
-export async function backfillCachedInputPricing({ db, apply = false }) {
-  const prices = await db.AiPricing.findAll({ where: { is_active: true }, raw: true });
-  const applied = [];
-  const blocked = [];
-  const skipped = [];
+export async function backfillCachedInputPricing({ db, apply = false, resolveConflicts = false, models = null }) {
+  const where = { is_active: true };
+  if (Array.isArray(models)) where.model = models;
+  const prices = await db.AiPricing.findAll({ where, raw: true, order: [["model", "ASC"]] });
+
+  const ready = [];      // will set a rate on a currently-null row
+  const changed = [];    // --resolve-conflicts overwrote a differing rate
+  const skipped = [];    // existing rate already equals the reviewed rate
+  const conflicts = [];  // existing rate/ref differs from reviewed config
+  const blocked = [];    // no verified reviewed cached rate
 
   for (const price of prices) {
-    const { rate, verified, known } = reviewedCachedRate(price.model);
+    const { rate, verified, known, referenceInput, referenceOutput } = reviewedCachedRate(price.model);
+    const before = Number(price.pricing_version) || 1;
 
-    if (price.cached_input_price_per_million != null) {
-      skipped.push({ model: price.model, reason: "already has a cached-input rate", rate: Number(price.cached_input_price_per_million) });
-      continue;
-    }
+    // Reference cross-check on the STANDARD rates. Never written — reported only.
+    const refIssues = [];
+    if (referenceInput != null && !eq(price.input_rate, referenceInput)) refIssues.push(`input_rate db=${price.input_rate} config=${referenceInput}`);
+    if (referenceOutput != null && !eq(price.output_rate, referenceOutput)) refIssues.push(`output_rate db=${price.output_rate} config=${referenceOutput}`);
+
     if (!known || !verified || rate == null) {
-      blocked.push({ model: price.model, reason: known ? "cached rate not verified in config" : "no reviewed cached rate", cached_input_execution: "blocked" });
+      blocked.push({ model: price.model, reason: known ? "cached rate not verified in config" : "no reviewed config entry", cached_input_execution: "blocked", ref_issues: refIssues });
       continue;
     }
 
-    const fromVersion = Number(price.pricing_version) || 1;
-    const toVersion = fromVersion + 1;
-    const catalog = await db.AiModelCatalog.findOne({ where: { provider: "openai", model: price.model } });
-    const profile = catalog ? parseProfile(catalog.request_profile) : null;
-    const nextCaps = { ...billingCapabilities(profile), cachedInput: true };
+    const catalog = await db.AiModelCatalog.findOne({ where: { provider: "openai", model: price.model }, raw: true });
+    const existing = price.cached_input_price_per_million;
 
-    if (apply) {
-      await db.sequelize.transaction(async transaction => {
-        await db.AiPricing.update(
-          { cached_input_price_per_million: rate, pricing_version: toVersion },
-          { where: { id: price.id, cached_input_price_per_million: null }, transaction },
-        );
-        if (catalog && profile) {
-          await catalog.update({ request_profile: { ...profile, billingCapabilities: nextCaps } }, { transaction });
-        }
-      });
+    if (refIssues.length) {
+      conflicts.push({ model: price.model, type: "standard_rate_reference_mismatch", details: refIssues, action: "not written by this script — fix the pricing rule or the config" });
     }
-    applied.push({
-      model: price.model, rate, pricing_version_from: fromVersion, pricing_version_to: toVersion,
-      catalog_profile: catalog ? "billingCapabilities.cachedInput -> true" : "no catalog row (rate only)",
+
+    if (existing == null) {
+      ready.push({ model: price.model, cached_rate: rate, pricing_version_from: before, pricing_version_to: before + 1, _price: price, _catalog: catalog });
+      continue;
+    }
+    if (eq(existing, rate)) {
+      skipped.push({ model: price.model, cached_rate: Number(existing), pricing_version: before });
+      continue;
+    }
+    // existing cached rate differs from the reviewed config
+    if (resolveConflicts) {
+      changed.push({ model: price.model, from_cached_rate: Number(existing), to_cached_rate: rate, pricing_version_from: before, pricing_version_to: before + 1, _price: price, _catalog: catalog });
+    } else {
+      conflicts.push({ model: price.model, type: "cached_rate_mismatch", db_cached_rate: Number(existing), config_cached_rate: rate, action: "left unchanged — pass --resolve-conflicts to overwrite" });
+    }
+  }
+
+  const versionsBefore = {};
+  const versionsAfter = {};
+  const writes = [...ready, ...changed];
+  for (const w of writes) {
+    versionsBefore[w.model] = w.pricing_version_from;
+    versionsAfter[w.model] = w.pricing_version_to;
+  }
+
+  if (apply && writes.length) {
+    await db.sequelize.transaction(async transaction => {
+      for (const w of writes) {
+        const price = w._price;
+        const targetRate = w.cached_rate ?? w.to_cached_rate;
+        const [affected] = await db.AiPricing.update(
+          { cached_input_price_per_million: targetRate, pricing_version: w.pricing_version_to },
+          {
+            where: resolveConflicts
+              ? { id: price.id }
+              : { id: price.id, cached_input_price_per_million: null }, // idempotency guard for the null-fill path
+            transaction,
+          },
+        );
+        if (!affected && !resolveConflicts) {
+          throw new Error(`Row ${price.model} changed under us (cached rate no longer null). Aborting — re-run.`);
+        }
+        const catalog = w._catalog;
+        if (catalog) {
+          const profile = parseProfile(catalog.request_profile);
+          if (profile) {
+            const nextCaps = { ...billingCapabilities(profile), cachedInput: true };
+            await db.AiModelCatalog.update(
+              { request_profile: { ...profile, billingCapabilities: nextCaps } },
+              { where: { id: catalog.id }, transaction },
+            );
+          }
+        }
+        await db.AdminAuditLog.create({
+          admin_id: "backfill-script",
+          action_type: "pricing_update",
+          details: { area: "ai_pricing", action: "cached_input_backfill", model: w.model, cached_rate: targetRate },
+          before_state: { cached_input_price_per_million: price.cached_input_price_per_million, pricing_version: w.pricing_version_from },
+          after_state: { cached_input_price_per_million: targetRate, pricing_version: w.pricing_version_to, billingCapabilities_cachedInput: true },
+          reason: "Backfill reviewed cached-input pricing",
+        }, { transaction });
+      }
     });
   }
 
-  return { applied, blocked, skipped, reviewedOn: CACHED_INPUT_PRICING_REVIEWED_ON };
+  const strip = ({ _price, _catalog, ...rest }) => rest;
+  return {
+    reviewedOn: CACHED_INPUT_PRICING_REVIEWED_ON,
+    modelsInspected: prices.length,
+    ready: ready.map(strip),
+    changed: changed.map(strip),
+    skipped,
+    conflicts,
+    blocked,
+    versionsBefore,
+    versionsAfter,
+  };
 }
 
-function report(result, apply) {
-  console.log(`\nCached-input pricing backfill  (config reviewed ${result.reviewedOn})`);
-  console.log(apply ? "MODE: APPLY (writing)\n" : "MODE: DRY RUN (no writes)\n");
+function report(env, result, apply) {
   const rows = arr => arr.length ? arr.map(r => "  " + JSON.stringify(r)).join("\n") : "  (none)";
-  console.log(`APPLIED / WOULD APPLY (${result.applied.length}):\n${rows(result.applied)}`);
-  console.log(`\nBLOCKED for cached-input execution (${result.blocked.length}):\n${rows(result.blocked)}`);
-  console.log(`\nSKIPPED — already priced (${result.skipped.length}):\n${rows(result.skipped)}`);
-  if (result.blocked.length) console.log("\n⚠  Blocked models will trigger a reconciliation event if OpenAI returns cached tokens. Add verified rates to src/config/aiCachedInputPricing.js.");
+  console.log("\n──────────────────────────────────────────────");
+  console.log(" Cached-input pricing backfill");
+  console.log("──────────────────────────────────────────────");
+  console.log(`Environment           : ${env.name}`);
+  console.log(`Database              : ${env.database} @ ${env.host}`);
+  console.log(`Config reviewed on    : ${result.reviewedOn}`);
+  console.log(`Mode                  : ${apply ? "APPLY (writing, single transaction)" : "DRY RUN (no writes)"}`);
+  console.log(`Models inspected      : ${result.modelsInspected}`);
+  console.log(`Ready (null -> set)   : ${result.ready.length}`);
+  console.log(`Changed (overwrite)   : ${result.changed.length}`);
+  console.log(`Skipped (already set) : ${result.skipped.length}`);
+  console.log(`Conflicts             : ${result.conflicts.length}`);
+  console.log(`Blocked               : ${result.blocked.length}`);
+  console.log(`\nPricing versions before/after (only rows that change):`);
+  const models = Object.keys(result.versionsAfter);
+  console.log(models.length ? models.map(m => `  ${m}: v${result.versionsBefore[m]} -> v${result.versionsAfter[m]}`).join("\n") : "  (none)");
+  console.log(`\nREADY:\n${rows(result.ready)}`);
+  console.log(`\nCHANGED:\n${rows(result.changed)}`);
+  console.log(`\nSKIPPED:\n${rows(result.skipped)}`);
+  console.log(`\nCONFLICTS:\n${rows(result.conflicts)}`);
+  console.log(`\nBLOCKED:\n${rows(result.blocked)}`);
+  if (result.blocked.length) console.log("\n⚠  Blocked models emit a reconciliation event (no wallet charge) if OpenAI returns cached tokens. Add verified rates to src/config/aiCachedInputPricing.js.");
+  if (result.conflicts.length) console.log("\n⚠  Conflicts were NOT written. Investigate the mismatch, then re-run with --resolve-conflicts if the reviewed config is authoritative.");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const apply = process.argv.includes("--apply");
-  const dryRun = process.argv.includes("--dry-run");
-  if (apply === dryRun) {
-    console.error("Pass exactly one of --dry-run or --apply");
+  const args = process.argv.slice(2);
+  const apply = args.includes("--apply");
+  const dryRun = args.includes("--dry-run") || !apply;
+  if (apply && args.includes("--dry-run")) { console.error("Pass either --dry-run or --apply, not both."); process.exit(2); }
+  const resolveConflicts = args.includes("--resolve-conflicts");
+  const modelsArg = args.find(a => a.startsWith("--models="));
+  const models = modelsArg ? modelsArg.slice("--models=".length).split(",").map(s => s.trim()).filter(Boolean) : null;
+
+  let env;
+  try { env = resolveEnvironment(); }
+  catch (e) { console.error(e.message); process.exit(2); }
+
+  if (apply && env.name === "production" && !args.includes("--allow-production")) {
+    console.error("Refusing to --apply against production without --allow-production.");
     process.exit(2);
   }
+
   const { default: db } = await import("../database/index.js");
   try {
-    const result = await backfillCachedInputPricing({ db, apply });
-    report(result, apply);
+    const result = await backfillCachedInputPricing({ db, apply: apply && !dryRun ? true : apply, resolveConflicts, models });
+    report(env, result, apply);
+    if (result.conflicts.length && !resolveConflicts) process.exitCode = 1;
   } finally {
     await db.sequelize.close();
   }

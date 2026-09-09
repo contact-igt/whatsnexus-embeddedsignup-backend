@@ -80,18 +80,74 @@ provider tokens.
 - **Expected request:** a 1×1 PNG data URI plus a text part; `detail: low`.
 - **Pass:** non-empty content, no refusal.
 
-## 7. Cached-input test
+## 7. Cached-input test  (authorised stage run only)
 
-- Send the same ~1,500-token prompt twice on a model with a verified cached rate
-  (`billingCapabilities.cachedInput: true`, `ai_pricing.cached_input_price_per_million` set).
-- **Expected usage (2nd call):** `cachedInputTokens > 0`.
-- **Expected billing:**
-  `base = max(input−cached,0)·in + cached·cachedIn + output·out`, then existing
-  markup + USD→INR + wallet/ledger. `ai_token_usage` row has
-  `cached_input_tokens > 0` and `cached_input_price_per_million` snapshotted.
-- **Fail path:** if the cached rate is missing → `AI_CACHED_PRICING_MISSING`
-  before the request (preflight) or a `billing_failure` "AI usage uncharged —
-  cached_input_unpriced" event with **no wallet charge**.
+**Do not run without explicit authorisation — this makes real billable calls.**
+
+Preconditions:
+- An authorised stage tenant with a working OpenAI credential.
+- A supported active model whose pricing rule has a non-null
+  `cached_input_price_per_million` and whose catalog profile has
+  `billingCapabilities.cachedInput: true` (run `backfillAiCachedInputPricing.js`
+  first). Use e.g. `gpt-4o` or `gpt-5.4`.
+- Note the tenant wallet balance and the model's `pricing_version`.
+
+Procedure:
+1. Build a **stable** prompt of **> 1,024 tokens** (prompt caching only kicks in
+   above that). Keep the leading content byte-for-byte identical between calls —
+   put any variable text at the very end.
+2. Send request #1 (warms the cache). Wait a few seconds.
+3. Send request #2 with the identical prompt prefix.
+4. Repeat #3 two or three more times if #2 shows `cachedInputTokens = 0` (cache
+   population is best-effort and can lag).
+
+Expected sanitised result (a cache-hit call):
+```json
+{ "usage": { "inputTokens": N, "cachedInputTokens": C, "outputTokens": O, ... } }
+```
+with `C > 0` and `C <= N`.
+
+Expected billing for that call:
+```
+uncached = max(inputTokens − cachedInputTokens, 0)
+baseUsd  = uncached/1e6 · input_rate
+         + cachedInputTokens/1e6 · cached_input_price_per_million
+         + outputTokens/1e6 · output_rate            (output charged ONCE; reasoning is already inside outputTokens)
+finalUsd = baseUsd · (1 + markup_percent/100)
+finalInr = finalUsd · usd_to_inr_rate               (via the currency service)
+```
+
+Expected database records:
+- `ai_token_usage`: `cached_input_tokens = C`, `cached_input_price_per_million`
+  snapshotted, `pricing_version` == the rule's current version,
+  `requested_model` / `actual_model` / `pricing_model` set, `base_cost_usd`,
+  `final_cost_usd`, `final_cost_inr` matching the formula, `billed: true`.
+- `billing_ledger`: one `entry_type: ai`, `billing_status: charged` row, same
+  `pricing_version` and `usd_to_inr_rate`.
+- wallet balance decreased by **exactly** `final_cost_inr` (6-dp rounded).
+- **No** `billing_system_health` row with message starting "AI usage uncharged".
+
+Pass criteria (all must hold):
+- `cachedInputTokens > 0` on at least one call.
+- uncached and cached input are split per the formula above.
+- output is charged once (compare against a no-cache call of the same size).
+- markup and FX unchanged from a non-cached baseline call.
+- wallet delta == calculated `final_cost_inr`.
+- ledger + usage snapshot agree; no reconciliation event.
+
+Recovery if it fails:
+- `cachedInputTokens` always 0 → the prompt prefix isn't stable enough or is
+  < 1,024 tokens; not a billing bug. Fix the prompt and retry.
+- Preflight throws `AI_TARIFF_UNSUPPORTED` / reason `CACHED_INPUT_RATE_MISSING`
+  → the rule has no cached rate. Run
+  `node src/scripts/backfillAiCachedInputPricing.js --dry-run` then `--apply`.
+- A "AI usage uncharged — cached_input_unpriced" health event with no wallet
+  charge → same cause; the request was correctly **not** billed. Add the rate,
+  then decide whether to raise a manual wallet adjustment for the untracked
+  usage (event id in the metadata).
+- wallet delta ≠ `final_cost_inr` → do NOT widen rollout. Capture the
+  `ai_token_usage` + `billing_ledger` rows and the raw usage, open a billing
+  incident, and revert the tenant to a non-cached model.
 
 ## 8. Wallet deduction
 
@@ -149,3 +205,4 @@ provider tokens.
 | `test_status = legacy_grandfathered` | in use, never live-tested — run §1 before re-activating or assigning to a new tenant |
 | `test_status = failed` | do not activate; fix the profile / access and re-test |
 | `billing_failure` "AI usage uncharged" | provider request succeeded, wallet **not** charged — reconcile per `deployment-and-rollback.md` |
+| `AI_TARIFF_UNSUPPORTED` / `CACHED_INPUT_RATE_MISSING` | pre-request block — the model can be cache-served but its rule has no cached rate. Run the backfill. |

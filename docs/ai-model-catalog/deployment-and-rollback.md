@@ -35,13 +35,24 @@ and `Whatnexus-frontend` `96013d3` + this pass.
    node src/scripts/backfillAiCachedInputPricing.js --dry-run
    node src/scripts/backfillAiCachedInputPricing.js --apply
    ```
-   Applies verified cached rates from `src/config/aiCachedInputPricing.js`,
-   bumps `pricing_version`, and flips `billingCapabilities.cachedInput` to true
-   on the matching catalog profile. Models with no verified rate are reported as
-   **blocked for cached-input execution** — until a rate is added they will emit
-   a reconciliation event (no wallet charge) if OpenAI returns cached tokens.
-   Add missing rates to the config file and re-run `--apply` (it never
-   overwrites an existing rate).
+   Dry-run is the default; `--apply` is required for any write; the whole apply
+   runs in ONE transaction and rolls back entirely on error. It:
+   - reads rates only from `src/config/aiCachedInputPricing.js` (reviewed config),
+   - matches EXACT model ids (never a prefix/family),
+   - sets a rate only on a currently-null row, bumps `pricing_version` only when
+     a rate actually changes, flips `billingCapabilities.cachedInput` on the
+     catalog profile, writes an `admin_audit_log` row per change,
+   - treats an equal existing rate as **skipped**; a differing existing rate as
+     a **conflict** that is left untouched unless you pass `--resolve-conflicts`,
+   - also cross-checks the reviewed standard input/output rates against the live
+     rule and reports (never writes) any mismatch,
+   - refuses an unknown `INVICTUS_SERVER_LINE`; `--apply` against production
+     additionally needs `--allow-production`.
+   Scope to specific models with `--models=gpt-5.4,gpt-5.4-mini`.
+   Models with no verified rate are reported **blocked for cached-input
+   execution** — until a rate is added they emit a reconciliation event (no
+   wallet charge) if OpenAI returns cached tokens. Add the rate to the config
+   and re-run `--apply`.
 5. **Deploy backend.**
 6. **Deploy frontend.**
 7. **Admin: refresh the catalog** — Pricing & Rates → Model Catalog → *Refresh
