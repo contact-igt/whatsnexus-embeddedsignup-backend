@@ -22,6 +22,8 @@ import {
   recordBillingHealthEvent,
 } from "../../utils/healthEventService.js";
 import { resolveMessageBillingReconciliation } from "../../services/reconciliationService.js";
+import { consumeBillingHoldAllocation } from "../../services/billingHold.service.js";
+import { checkBillingAccess } from "../../services/billingAccess.service.js";
 
 const phoneUtil = libphonenumber.PhoneNumberUtil.getInstance();
 
@@ -90,6 +92,22 @@ export const processBillingFromWebhook = async (tenant_id, statusUpdate) => {
     const billable = pricing.billable;
     const conversation_id = conversation?.id || null;
 
+    // Campaign sends snapshot their authorized mode before the Meta request.
+    // Delayed webhooks must bill that snapshot even if the tenant switches mode.
+    const campaignRecipientBilling = await db.WhatsappCampaignRecipients.findOne({
+      where: { meta_message_id: message_id },
+      attributes: ["billing_hold_id", "authorized_billing_mode", "authorized_cost_inr"],
+      raw: true,
+    });
+    const outboundMessageBilling = await db.Messages.findOne({
+      where: { wamid: message_id },
+      attributes: ["billing_mode_snapshot"],
+      raw: true,
+    });
+    const authorizedBillingMode =
+      campaignRecipientBilling?.authorized_billing_mode ||
+      outboundMessageBilling?.billing_mode_snapshot ||
+      null;
     // 1. Create MessageUsage Record (Tracks BOTH billable and free conversations)
     // Use findOrCreate to handle race conditions where multiple webhooks arrive simultaneously
     const [usageRecord, created] = await db.MessageUsage.findOrCreate({
@@ -100,12 +118,19 @@ export const processBillingFromWebhook = async (tenant_id, statusUpdate) => {
         conversation_id,
         category,
         billable,
+        billing_mode_snapshot: authorizedBillingMode,
         status, // 'sent'
         timestamp: new Date(),
       },
     });
 
     let shouldCreateLedger = created;
+
+    if (!usageRecord.billing_mode_snapshot && authorizedBillingMode) {
+      await usageRecord.update({
+        billing_mode_snapshot: authorizedBillingMode,
+      });
+    }
 
     // If record already existed, just update status if changed
     if (!created) {
@@ -244,7 +269,7 @@ export const processBillingFromWebhook = async (tenant_id, statusUpdate) => {
       attributes: ["billing_mode", "postpaid_credit_limit"],
       raw: true,
     });
-    const billing_mode = tenant?.billing_mode || "prepaid";
+    const billing_mode = usageRecord.billing_mode_snapshot || tenant?.billing_mode || "prepaid";
 
     // 5. Check usage limits before billing
     const usageCheck = await checkUsageLimit(tenant_id, "message");
@@ -265,6 +290,7 @@ export const processBillingFromWebhook = async (tenant_id, statusUpdate) => {
         await db.BillingLedger.create({
           tenant_id,
           entry_type: "message",
+          billing_mode_snapshot: billing_mode,
           message_usage_id: usageRecord.id,
           template_name: null,
           campaign_name: null,
@@ -286,7 +312,14 @@ export const processBillingFromWebhook = async (tenant_id, statusUpdate) => {
           ledgerErr.message,
         );
       }
-      invalidateUsageCache(tenant_id);
+      await db.sequelize.transaction((transaction) =>
+        consumeBillingHoldAllocation(
+          campaignRecipientBilling?.billing_hold_id,
+          campaignRecipientBilling?.authorized_cost_inr,
+          transaction,
+          "usage_limit_rejected",
+        ),
+      );      invalidateUsageCache(tenant_id);
       return;
     }
 
@@ -348,6 +381,7 @@ export const processBillingFromWebhook = async (tenant_id, statusUpdate) => {
         {
           tenant_id,
           entry_type: "message",
+          billing_mode_snapshot: billing_mode,
           message_usage_id: usageRecord.id,
           template_name: template_name,
           campaign_name: campaign_name,
@@ -440,6 +474,11 @@ export const processBillingFromWebhook = async (tenant_id, statusUpdate) => {
         }
       }
 
+      await consumeBillingHoldAllocation(
+        campaignRecipientBilling?.billing_hold_id,
+        campaignRecipientBilling?.authorized_cost_inr,
+        t,
+      );
       // Update daily + monthly usage summaries (both modes)
       try {
         const today = new Date().toISOString().split("T")[0];
@@ -957,9 +996,11 @@ export const getWalletBalanceService = async (tenant_id) => {
         ? parseFloat(activeCycle.total_cost_inr) || 0
         : 0;
 
+      const access = await checkBillingAccess(tenant_id, 0);
       result.postpaid = {
         currentCycleUsage,
         creditLimit,
+        availableCredit: access.available_amount,
         creditUsagePercent:
           creditLimit > 0
             ? Math.round((currentCycleUsage / creditLimit) * 100)
@@ -1557,11 +1598,14 @@ export const getBillingModeService = async (tenant_id) => {
         where: { tenant_id, status: "active" },
         raw: true,
       });
+      const access = await checkBillingAccess(tenant_id, 0);
       result.postpaid = {
         credit_limit: parseFloat(tenant.postpaid_credit_limit) || 5000,
         current_usage: activeCycle
           ? parseFloat(activeCycle.total_cost_inr) || 0
           : 0,
+        available_credit: access.available_amount,
+        held_amount: access.held_amount,
         cycle_number: activeCycle?.cycle_number || 0,
       };
     }

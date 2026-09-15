@@ -28,6 +28,7 @@ import { getTemplateComponents } from "../utils/templateCache.js";
 import { getCampaignCache } from "../utils/redis/redisCache.js";
 import { getRedisLock } from "../utils/redis/redisLock.js";
 import { getMetaApiCircuitBreaker } from "../services/circuitBreakerService.js";
+import { releaseRecipientBillingAllocation } from "../services/billingHold.service.js";
 import db from "../database/index.js";
 import { tableNames } from "../database/tableName.js";
 import { sendWhatsAppTemplate } from "../models/AuthWhatsapp/AuthWhatsapp.service.js";
@@ -278,6 +279,7 @@ async function processSendJob(job) {
   // Pause is honored at job start. Jobs that already passed this point may still
   // finish their Meta request; dispatch fan-out is what stops additional sends.
   if (["paused", "cancelled", "completed"].includes(campaign.status)) {
+    await releaseRecipientBillingAllocation(recipient_id, `campaign_${campaign.status}`);
     logger.info(
       `[SEND-WORKER] Campaign ${campaign_id} is ${campaign.status} — discarding job`,
     );
@@ -846,6 +848,7 @@ async function processSendJob(job) {
         media_url: finalMediaUrl,
         media_mime_type: campaignMediaMimeType,
         status: "sent",
+        billing_mode_snapshot: recipient.authorized_billing_mode || null,
         template_name: campaign.template.template_name || null,
         interactive_payload: null,
         media_filename:
@@ -1017,6 +1020,8 @@ async function processSendJob(job) {
         );
       }
 
+      await releaseRecipientBillingAllocation(recipient_id, "meta_auth_failure");
+
       return; // do NOT throw — job is done, campaigns are paused
     }
 
@@ -1042,6 +1047,7 @@ async function processSendJob(job) {
       });
       // Flush immediately to persist permanent failure
       await flushTenantBuffers(tId);
+      await releaseRecipientBillingAllocation(recipient_id, "permanent_send_failure");
       return; // do NOT throw — BullMQ will treat this as a successful job
     }
 
@@ -1093,6 +1099,8 @@ const markRecipientPermanentlyFailed = async (
     );
     return;
   }
+
+  await releaseRecipientBillingAllocation(recipientId, "retry_exhausted");
 
   // The retry-exhaustion path bypasses the buffered flush, so finalize the
   // campaign here too — otherwise a campaign whose last recipients fail via
