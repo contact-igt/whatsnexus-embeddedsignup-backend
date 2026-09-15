@@ -68,6 +68,7 @@ import { TenantSecretsTable } from "./tables/TenantSecretsTable/index.js";
 import { UserPreferencesTable } from "./tables/UserPreferencesTable/index.js";
 import { MentorsTable } from "./tables/MentorsTable/index.js";
 import { CoursesTable } from "./tables/CoursesTable/index.js";
+import { CourseSessionsTable } from "./tables/CourseSessionsTable/index.js";
 import { TenantFeatureAccessTable } from "./tables/TenantFeatureAccessTable/index.js";
 import { ScheduledMessageTable } from "./tables/ScheduledMessageTable/index.js";
 import { AppointmentReminderRulesTable } from "./tables/AppointmentReminderRulesTable/index.js";
@@ -214,6 +215,7 @@ db.TenantSecrets = TenantSecretsTable(sequelize, Sequelize);
 db.UserPreferences = UserPreferencesTable(sequelize, Sequelize);
 db.Mentors = MentorsTable(sequelize, Sequelize);
 db.Courses = CoursesTable(sequelize, Sequelize);
+db.CourseSessions = CourseSessionsTable(sequelize, Sequelize);
 db.TenantFeatureAccess = TenantFeatureAccessTable(sequelize, Sequelize);
 db.ScheduledMessages = ScheduledMessageTable(sequelize, Sequelize);
 db.AppointmentReminderRules = AppointmentReminderRulesTable(
