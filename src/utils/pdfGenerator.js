@@ -1,14 +1,8 @@
 // backend/src/utils/pdfGenerator.js
 
 import PDFDocument from "pdfkit";
-import db from "../database/index.js";
+import { displayText, displayDate, displayMoney, invoiceNumber, drawCompanyHeader } from "./invoiceDisplay.js";
 
-const {
-  MonthlyInvoices: MonthlyInvoice,
-  Tenants: Tenant,
-  BillingCycles: BillingCycle,
-  PaymentHistory,
-} = db;
 
 // Helper: Convert number to words (Indian Rupees)
 function numberToWords(amount) {
@@ -92,6 +86,8 @@ function numberToWords(amount) {
 }
 
 async function generateInvoicePdf(invoiceId, tenantId) {
+  const { default: db } = await import("../database/index.js");
+  const { MonthlyInvoices: MonthlyInvoice, BillingCycles: BillingCycle, PaymentHistory } = db;
   // Fetch invoice, billing cycle, tenant
   const whereClause = tenantId
     ? { id: invoiceId, tenant_id: tenantId }
@@ -118,228 +114,126 @@ async function generateInvoicePdf(invoiceId, tenantId) {
   }
 
   const billingCycle = await BillingCycle.findOne({
-    where: { id: invoice.billing_cycle_id },
+    where: { id: invoice.billing_cycle_id, tenant_id: invoice.tenant_id },
   });
   const payment = await PaymentHistory.findOne({
-    where: { invoice_number: invoice.invoice_number },
+    where: { invoice_number: invoice.invoice_number, tenant_id: invoice.tenant_id, status: "success" },
+    order: [["createdAt", "DESC"]],
   });
 
-  // Company details from env
-  const company_name = process.env.COMPANY_NAME || "Your Company";
-  const company_address = process.env.COMPANY_ADDRESS || "";
-  const company_gstin = process.env.COMPANY_GSTIN || "";
-  const company_cin = process.env.COMPANY_CIN || "";
+  return renderInvoicePdf(invoice, tenant, billingCycle, payment);
+}
 
-  const is_intra_state = invoice.tenant_state === invoice.company_state;
-  const invoiceGstRate = Number(invoice.gst_rate || 18);
-  const halfInvoiceGstRate = invoiceGstRate / 2;
-
-  const formatRateLabel = (rate) => {
-    if (!Number.isFinite(rate)) return "0";
-    return rate % 1 === 0
-      ? rate.toFixed(0)
-      : rate
-        .toFixed(2)
-        .replace(/\.0+$/, "")
-        .replace(/(\.\d*[1-9])0+$/, "$1");
-  };
-
-  // Create PDF document
+export function renderInvoicePdf(invoice, tenant, billingCycle = null, payment = null, env = process.env) {
   const doc = new PDFDocument({ margin: 50, size: "A4" });
   const chunks = [];
-
-  doc.on("data", (chunk) => chunks.push(chunk));
-
-  // Return promise that resolves with buffer
-  const pdfPromise = new Promise((resolve, reject) => {
+  doc.on("data", chunk => chunks.push(chunk));
+  const result = new Promise((resolve, reject) => {
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
   });
-
-  // Header
-  doc.fontSize(20).font("Helvetica-Bold").text(company_name, { align: "left" });
-  doc.fontSize(10).font("Helvetica").text(company_address);
-  doc.text(`GSTIN: ${company_gstin} | CIN: ${company_cin}`);
-  doc.moveDown();
-
-  // Invoice details (right side)
-  doc
-    .fontSize(12)
-    .font("Helvetica-Bold")
-    .text("TAX INVOICE", { align: "right" });
-  doc.fontSize(10).font("Helvetica");
-  doc.text(`Invoice #: ${invoice.invoice_number || invoiceId}`, {
-    align: "right",
-  });
-  doc.text(
-    `Date: ${invoice.invoice_date ? invoice.invoice_date.toISOString().slice(0, 10) : ""}`,
-    { align: "right" },
-  );
-  doc.text(
-    `Due Date: ${invoice.due_date ? invoice.due_date.toISOString().slice(0, 10) : ""}`,
-    { align: "right" },
-  );
-  doc.moveDown();
-
-  // Line separator
-  doc.moveTo(50, doc.y).lineTo(545, doc.y).stroke();
-  doc.moveDown();
-
-  // Bill To section
-  doc.fontSize(12).font("Helvetica-Bold").text("Bill To:");
-  doc.fontSize(10).font("Helvetica");
-  doc.text(tenant.company_name || tenant.name || "");
-  doc.text(tenant.address || "");
-  doc.text(`GSTIN: ${invoice.tenant_gstin || "Unregistered"}`);
-  doc.text(`State: ${invoice.tenant_state || ""}`);
-  doc.moveDown();
-
-  // Line items table header
-  const tableTop = doc.y;
-  doc.fontSize(10).font("Helvetica-Bold");
-  doc.text("Description", 50, tableTop);
-  doc.text("Period", 280, tableTop);
-  doc.text("Amount (INR)", 450, tableTop, { width: 95, align: "right" });
-
-  doc
-    .moveTo(50, tableTop + 15)
-    .lineTo(545, tableTop + 15)
-    .stroke();
-
-  // Line items
-  let y = tableTop + 25;
-  doc.font("Helvetica");
-
-  const cycleStart = billingCycle
-    ? billingCycle.start_date.toISOString().slice(0, 10)
-    : "";
-  const cycleEnd = billingCycle
-    ? billingCycle.end_date.toISOString().slice(0, 10)
-    : "";
-  const period = `${cycleStart} to ${cycleEnd}`;
-
-  // WhatsApp charges
-  doc.text("WhatsApp message charges", 50, y);
-  doc.text(period, 280, y);
-  doc.text(`${invoice.total_message_cost_inr || "0.00"}`, 450, y, {
-    width: 95,
-    align: "right",
-  });
-  y += 20;
-
-  // AI charges
-  doc.text("AI model usage charges", 50, y);
-  doc.text(period, 280, y);
-  doc.text(`${invoice.total_ai_cost_inr || "0.00"}`, 450, y, {
-    width: 95,
-    align: "right",
-  });
-  y += 20;
-
-  // Subtotal
-  doc.moveTo(50, y).lineTo(545, y).stroke();
-  y += 10;
-  doc.font("Helvetica-Bold");
-  doc.text("Subtotal", 350, y);
-  doc.text(`${invoice.base_amount || "0.00"}`, 450, y, {
-    width: 95,
-    align: "right",
-  });
-  y += 20;
-
-  // Tax section
-  doc.font("Helvetica");
-  if (is_intra_state) {
-    doc.text(`CGST @ ${formatRateLabel(halfInvoiceGstRate)}%`, 350, y);
-    doc.text(`${invoice.cgst_amount || "0.00"}`, 450, y, {
-      width: 95,
-      align: "right",
-    });
-    y += 15;
-    doc.text(`SGST @ ${formatRateLabel(halfInvoiceGstRate)}%`, 350, y);
-    doc.text(`${invoice.sgst_amount || "0.00"}`, 450, y, {
-      width: 95,
-      align: "right",
-    });
-    y += 15;
-  } else {
-    doc.text(`IGST @ ${formatRateLabel(invoiceGstRate)}%`, 350, y);
-    doc.text(`${invoice.igst_amount || "0.00"}`, 450, y, {
-      width: 95,
-      align: "right",
-    });
-    y += 15;
-  }
-
-  // Total
-  doc.moveTo(350, y).lineTo(545, y).stroke();
-  y += 10;
-  doc.fontSize(12).font("Helvetica-Bold");
-  doc.text("TOTAL", 350, y);
-  doc.text(`INR ${invoice.total_amount || "0.00"}`, 450, y, {
-    width: 95,
-    align: "right",
-  });
-  y += 25;
-
-  // Amount in words
-  doc.fontSize(10).font("Helvetica-Oblique");
-  doc.text(
-    `Amount in words: ${numberToWords(Number(invoice.total_amount || 0))}`,
-    50,
-    y,
-  );
-  y += 30;
-
-  // Payment details
-  if (payment) {
-    doc.font("Helvetica-Bold").text("Payment Details:", 50, y);
-    y += 15;
-    doc.font("Helvetica");
-    doc.text(`Payment Method: ${payment.method || ""}`, 50, y);
-    y += 12;
-    doc.text(`Payment ID: ${payment.payment_id || ""}`, 50, y);
-    y += 12;
-    doc.text(
-      `Payment Date: ${payment.paid_at ? payment.paid_at.toISOString().slice(0, 10) : ""}`,
-      50,
-      y,
-    );
-    y += 20;
-  }
-
-  // Status badge
-  const status = invoice.status || "unpaid";
-  const statusColors = {
-    paid: "#27ae60",
-    unpaid: "#f1c40f",
-    overdue: "#e74c3c",
+  const line = (text, options = {}) => doc.text(text, 50, doc.y, { width: 495, ...options });
+  const rule = () => {
+    if (doc.y > doc.page.height - 70) doc.addPage();
+    doc.moveTo(50, doc.y + 5).lineTo(545, doc.y + 5).stroke();
+    doc.y += 15;
   };
-  doc.rect(50, y, 60, 20).fill(statusColors[status] || "#f1c40f");
-  doc.fillColor("#fff").fontSize(10).font("Helvetica-Bold");
-  doc.text(status.toUpperCase(), 55, y + 5);
-  doc.fillColor("#000");
-  y += 40;
+  // Measure every row so wrapped text and page breaks do not overlap later rows.
+  const row = (values, widths) => {
+    const height = Math.max(...values.map((value, index) => doc.heightOfString(value, { width: widths[index] - 10 }))) + 10;
+    if (doc.y + height > doc.page.height - 50) doc.addPage();
+    const top = doc.y;
+    let x = 50;
+    values.forEach((value, index) => {
+      doc.text(value, x, top, { width: widths[index] - 10, align: index === values.length - 1 ? "right" : "left" });
+      x += widths[index];
+    });
+    doc.x = 50;
+    doc.y = top + height;
+  };
 
-  // Footer
+  drawCompanyHeader(doc, env);
+  doc.fontSize(12).font("Helvetica-Bold");
+  line("TAX INVOICE", { align: "right" });
+  doc.fontSize(10).font("Helvetica");
+  line("Invoice #: " + displayText(invoice.invoice_number, String(invoice.id ?? "Not provided")), { align: "right" });
+  line("Date: " + displayDate(invoice.invoice_date || invoice.createdAt || invoice.created_at), { align: "right" });
+  line("Due Date: " + displayDate(invoice.due_date), { align: "right" });
+  rule();
+  doc.fontSize(12).font("Helvetica-Bold");
+  line("Bill To:");
+  doc.fontSize(10).font("Helvetica");
+  line(displayText(tenant.company_name, displayText(tenant.name)));
+  line("Address: " + displayText(tenant.address));
+  const locality = [tenant.city, tenant.pincode, tenant.country].map(value => displayText(value, "")).filter(Boolean).join(", ");
+  if (locality) line(locality);
+  line("GSTIN: " + displayText(invoice.tenant_gstin, "Not recorded"));
+  line("State: " + displayText(invoice.tenant_state, "Not recorded"));
+  doc.moveDown();
+
+  const period = billingCycle ? displayDate(billingCycle.start_date) + " to " + displayDate(billingCycle.end_date) : "Not provided";
+  doc.font("Helvetica-Bold");
+  row(["Description", "Period", "Amount (INR)"], [225, 165, 105]);
+  rule();
+  doc.font("Helvetica");
+  row(["WhatsApp message charges", period, displayMoney(invoice.total_message_cost_inr)], [225, 165, 105]);
+  row(["AI model usage charges", period, displayMoney(invoice.total_ai_cost_inr)], [225, 165, 105]);
+  rule();
+  doc.font("Helvetica-Bold");
+  row(["Subtotal", displayMoney(invoice.base_amount)], [330, 165]);
+  doc.font("Helvetica");
+
+  const base = invoiceNumber(invoice.base_amount);
+  const gst = invoiceNumber(invoice.gst_amount);
+  const rate = invoiceNumber(invoice.gst_rate) ?? (base > 0 && gst !== null ? gst / base * 100 : null);
+  const taxLabel = (name, value) => value === null ? name + " (rate not recorded)" : name + " @ " + Number(value.toFixed(2)) + "%";
+  const cgst = invoiceNumber(invoice.cgst_amount);
+  const sgst = invoiceNumber(invoice.sgst_amount);
+  const igst = invoiceNumber(invoice.igst_amount);
+  const sameState = displayText(invoice.tenant_state, "").toUpperCase() === displayText(invoice.company_state, "").toUpperCase();
+  const hasStates = !!displayText(invoice.tenant_state, "") && !!displayText(invoice.company_state, "");
+  // Prefer recorded tax components; missing states must not imply intra-state tax.
+  if (cgst > 0 || sgst > 0 || (igst === 0 && hasStates && sameState)) {
+    row([taxLabel("CGST", rate === null ? null : rate / 2), displayMoney(invoice.cgst_amount)], [330, 165]);
+    row([taxLabel("SGST", rate === null ? null : rate / 2), displayMoney(invoice.sgst_amount)], [330, 165]);
+  }
+  if (igst > 0 || (hasStates && !sameState && !(cgst > 0 || sgst > 0))) {
+    row([taxLabel("IGST", rate), displayMoney(invoice.igst_amount)], [330, 165]);
+  } else if (!(cgst > 0 || sgst > 0 || (igst === 0 && hasStates && sameState))) {
+    row([taxLabel("GST", rate), displayMoney(invoice.gst_amount)], [330, 165]);
+  }
+  rule();
+  const total = invoiceNumber(invoice.total_amount) ?? invoiceNumber(invoice.amount);
+  doc.fontSize(12).font("Helvetica-Bold");
+  row(["TOTAL (INR)", displayMoney(total)], [330, 165]);
+  doc.fontSize(10).font("Helvetica-Oblique");
+  line("Amount in words: " + (total === null ? "Not available" : numberToWords(total)));
+  doc.moveDown();
+  doc.font("Helvetica");
+
+  if (payment || invoice.paid_at || displayText(invoice.payment_reference, "")) {
+    doc.font("Helvetica-Bold");
+    line("Payment Details:");
+    doc.font("Helvetica");
+    line("Payment Method: " + displayText(payment?.payment_method));
+    line("Payment ID: " + displayText(payment?.razorpay_payment_id, displayText(invoice.payment_reference)));
+    line("Payment Date: " + displayDate(invoice.paid_at || payment?.createdAt || payment?.created_at));
+    doc.moveDown();
+  }
+  doc.font("Helvetica-Bold");
+  line("Status: " + displayText(invoice.status, "Not recorded").toUpperCase());
+  doc.moveDown();
   doc.fontSize(9).font("Helvetica").fillColor("#666");
-  doc.text(
-    "This is a computer-generated invoice. No signature required.",
-    50,
-    y,
-  );
-  y += 12;
-  doc.text("HSN/SAC: 998314 — Software as a Service", 50, y);
-  y += 12;
-  doc.text("Terms: Payment due within 15 days of invoice date.", 50, y);
-
-  // Finalize PDF
+  line("This is a computer-generated invoice. No signature required.");
+  line("HSN/SAC: " + displayText(invoice.hsn_sac_code, "Not recorded"));
+  line("Payment due date: " + displayDate(invoice.due_date));
   doc.end();
-
-  return pdfPromise;
+  return result;
 }
 
 async function generateReceiptPdf(paymentId, tenantId) {
+  const { default: db } = await import("../database/index.js");
+  const { PaymentHistory } = db;
   const whereClause = tenantId
     ? { id: paymentId, tenant_id: tenantId }
     : { id: paymentId };
@@ -361,11 +255,6 @@ async function generateReceiptPdf(paymentId, tenantId) {
     throw { code: "NOT_FOUND", message: "Tenant not found", statusCode: 404 };
   }
 
-  // Company details from env
-  const company_name = process.env.COMPANY_NAME || "Your Company";
-  const company_address = process.env.COMPANY_ADDRESS || "";
-  const company_gstin = process.env.COMPANY_GSTIN || "";
-  const company_cin = process.env.COMPANY_CIN || "";
 
   const doc = new PDFDocument({ margin: 50, size: "A4" });
   const chunks = [];
@@ -378,10 +267,7 @@ async function generateReceiptPdf(paymentId, tenantId) {
   });
 
   // Header
-  doc.fontSize(20).font("Helvetica-Bold").text(company_name, { align: "left" });
-  doc.fontSize(10).font("Helvetica").text(company_address);
-  doc.text(`GSTIN: ${company_gstin} | CIN: ${company_cin}`);
-  doc.moveDown();
+  drawCompanyHeader(doc);
 
   // Receipt details (right side)
   doc
@@ -409,8 +295,8 @@ async function generateReceiptPdf(paymentId, tenantId) {
   // Bill To section
   doc.fontSize(12).font("Helvetica-Bold").text("Received From:");
   doc.fontSize(10).font("Helvetica");
-  doc.text(tenant.company_name || tenant.name || "");
-  doc.text(tenant.address || "");
+  doc.text(displayText(tenant.company_name, displayText(tenant.name)));
+  doc.text(`Address: ${displayText(tenant.address)}`);
   doc.text(`Tenant ID: ${tenant.tenant_id}`);
   doc.moveDown();
 

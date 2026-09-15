@@ -4,6 +4,8 @@ import fileUpload from "express-fileupload";
 import http from "http";
 import dns from "dns";
 import db from "./database/index.js";
+import ServerEnvironmentConfig from "./config/server.config.js";
+import { resolveStartupMigrationMode } from "./config/startupMigrationMode.js";
 import { initSocket } from "./middlewares/socket/socket.js";
 import AuthWhatsappRouter from "./models/AuthWhatsapp/AuthWhatsapp.routes.js";
 import WhatsappMessageRouter from "./models/Messages/messages.routes.js";
@@ -210,11 +212,17 @@ app.use((err, req, res, next) => {
 {
   const MAX_RETRIES = 5;
   const RETRY_DELAY_MS = 3000;
-  // Auto schema-alter at startup is a development convenience. In production the
-  // schema is owned by explicit migrations; set DB_AUTO_MIGRATE=true only to
-  // deliberately re-enable it there.
-  const isProd = (process.env.NODE_ENV || "").toLowerCase() === "production";
-  const autoMigrate = process.env.DB_AUTO_MIGRATE === "true" || (!isProd && process.env.DB_AUTO_MIGRATE !== "false");
+  const { isProduction, autoMigrate, reason } = resolveStartupMigrationMode({
+    serverLine: ServerEnvironmentConfig?.server?.line,
+    DB_AUTO_MIGRATE: process.env.DB_AUTO_MIGRATE,
+    ALLOW_PRODUCTION_SCHEMA_ALTER: process.env.ALLOW_PRODUCTION_SCHEMA_ALTER,
+  });
+  logger.info(`[DB] startup migration mode: ${reason}`);
+  if (isProduction && autoMigrate) {
+    logger.warn(
+      "[DB] ⚠  ALLOW_PRODUCTION_SCHEMA_ALTER=true — sequelize.sync({ alter: true }) will run against PRODUCTION. This should only ever be a deliberate, supervised action.",
+    );
+  }
   let lastErr;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {

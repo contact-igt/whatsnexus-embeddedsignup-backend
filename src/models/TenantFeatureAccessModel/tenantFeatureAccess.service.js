@@ -6,6 +6,7 @@ import {
   isValidIndustryType,
   resolveTenantFeatureAccess,
 } from "../../config/featureAccess.config.js";
+import { getTenantDynamicAccessService } from "../ModuleAccessModel/moduleAccess.service.js";
 
 const LEGACY_HEALTHCARE_TYPES = new Set(["hospital", "clinic"]);
 
@@ -45,6 +46,24 @@ export const getTenantFeatureOverridesService = async (tenant_id) => {
   }));
 };
 
+// Pull in feature keys enabled through the dynamic SaaS-module system
+// (Tenant Dynamic Access Management → tenant_saas_module_overrides / industry /
+// plan mappings). Module keys are seeded to match feature keys, so any enabled
+// module whose key is a known feature counts as an enabled feature. Failures
+// (dynamic tables unseeded in an environment) fall back to an empty list.
+const getDynamicEnabledFeatureKeys = async (tenant_id) => {
+  try {
+    const dynamicAccess = await getTenantDynamicAccessService(tenant_id);
+    return (dynamicAccess.enabled_module_keys || []).filter(isValidFeatureKey);
+  } catch (err) {
+    console.error(
+      `[TENANT-FEATURES] Failed to resolve dynamic module access for ${tenant_id}:`,
+      err?.message,
+    );
+    return [];
+  }
+};
+
 export const getResolvedTenantFeaturesService = async (tenant_id) => {
   const tenant = await getTenantOrThrow(tenant_id);
   const industryType = inferIndustryType(tenant);
@@ -52,12 +71,26 @@ export const getResolvedTenantFeaturesService = async (tenant_id) => {
 
   const resolved = resolveTenantFeatureAccess(industryType, overrides);
 
+  // Union the two access systems so the sidebar, route guard, and feature
+  // middleware all agree. Union only — a dynamic module never disables a
+  // feature the feature-access resolver enabled.
+  const dynamicEnabledKeys = await getDynamicEnabledFeatureKeys(tenant_id);
+  const enabledSet = new Set([
+    ...resolved.enabled_features,
+    ...dynamicEnabledKeys,
+  ]);
+
+  const enabled_features = [...enabledSet];
+  const disabled_features = FEATURE_METADATA.map((feature) => feature.key).filter(
+    (featureKey) => !enabledSet.has(featureKey),
+  );
+
   return {
     industry_type: resolved.industry_type,
     default_features: resolved.default_features,
     overrides,
-    enabled_features: resolved.enabled_features,
-    disabled_features: resolved.disabled_features,
+    enabled_features,
+    disabled_features,
     feature_metadata: FEATURE_METADATA,
   };
 };
