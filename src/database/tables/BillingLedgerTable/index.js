@@ -129,10 +129,10 @@ export const BillingLedgerTable = (sequelize, Sequelize) => {
       },
 
       billing_status: {
-        type: Sequelize.ENUM("charged", "insufficient_balance", "free"),
+        type: Sequelize.ENUM("charged", "insufficient_balance", "free", "usage_limit_exceeded"),
         allowNull: false,
         defaultValue: "charged",
-        comment: "charged = wallet deducted or postpaid cycle updated; insufficient_balance = prepaid deduction failed; free = zero-cost entry",
+        comment: "charged = wallet deducted or postpaid cycle updated; insufficient_balance = prepaid deduction failed; free = zero-cost entry; usage_limit_exceeded = call blocked by a daily/monthly usage limit",
       },
 
       createdAt: {

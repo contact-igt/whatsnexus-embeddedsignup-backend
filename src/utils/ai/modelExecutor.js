@@ -7,15 +7,27 @@ export function requestByteSize(messages) {
   return Buffer.byteLength(JSON.stringify(messages ?? []), "utf8");
 }
 
+// True only when a message carries a real image content part.
+export function messagesHaveImageInput(messages) {
+  if (!Array.isArray(messages)) return false;
+  return messages.some(m => Array.isArray(m?.content) && m.content.some(part =>
+    part && typeof part === "object" && (
+      (part.type === "image_url" && part.image_url) ||
+      (part.type === "input_image" && (part.image_url || part.file_id))
+    ),
+  ));
+}
+
 export function buildModelRequest({ model, profile, messages, maxTokens, temperature, topP, responseFormat }) {
   validateModelId(model);
   profile = validateRequestProfile(profile);
   const caps = billingCapabilities(profile);
   if (!Array.isArray(messages) || !messages.length) throw new ModelConfigurationError("Messages are required.");
   if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > profile.maxOutputTokens) throw new ModelConfigurationError("Output token budget exceeds the approved profile.");
-  const serialized = JSON.stringify(messages);
   if (requestByteSize(messages) > profile.maxInputBytes) throw new ModelConfigurationError("Request exceeds the approved maxInputBytes ceiling.", "AI_REQUEST_TOO_LARGE");
-  if (serialized.includes('"image_url"') && !profile.modalities.includes("image_input")) throw new ModelConfigurationError("Image input is not approved.");
+  // Detect image input by INSPECTING structured content parts — not by string
+  // matching the serialized JSON (a user typing "image_url" must not trip this).
+  if (messagesHaveImageInput(messages) && !profile.modalities.includes("image_input")) throw new ModelConfigurationError("Image input is not approved.");
 
   // Sampling params: sent ONLY when the reviewed profile allows them. A caller
   // default (e.g. callAI's temperature: 0.01) is dropped, not an error, for a
@@ -69,10 +81,41 @@ export function normalizeModelResponse(raw, model, endpoint) {
     requestedModel: model, actualModel: raw.model, endpoint, usage, rawResponse: raw };
 }
 
-export async function executeModel(client, options) {
+/**
+ * Build + send the provider request. Returns the RAW provider response so the
+ * caller can normalise it under its own try/catch (a broken usage payload must
+ * be reconciled, not lost). Throws only on a genuine provider/transport error
+ * (nothing was billed by OpenAI in that case).
+ */
+export async function executeProviderRequest(client, options) {
   const params = buildModelRequest(options);
-  const raw = options.profile.endpoint === "responses"
-    ? await client.responses.create(params, { timeout: 45000, maxRetries: 0 })
-    : await client.chat.completions.create(params, { timeout: 45000, maxRetries: 0 });
+  return options.profile.endpoint === "responses"
+    ? client.responses.create(params, { timeout: 45000, maxRetries: 0 })
+    : client.chat.completions.create(params, { timeout: 45000, maxRetries: 0 });
+}
+
+/** Convenience: send + normalise in one step (used by the compatibility test). */
+export async function executeModel(client, options) {
+  const raw = await executeProviderRequest(client, options);
   return normalizeModelResponse(raw, options.model, options.profile.endpoint);
+}
+
+/**
+ * Classify the application-level outcome of a normalised response so billing can
+ * record it and the caller can raise the right controlled error.
+ * @returns {"success"|"refusal"|"content_filtered"|"incomplete"|"token_exhausted"|"invalid_structured_output"}
+ */
+export function classifyResponseOutcome(normalized, responseFormat) {
+  if (normalized.refusal) return "refusal";
+  const reason = normalized.incompleteReason || normalized.finishReason;
+  if (normalized.incomplete) {
+    if (reason === "length" || reason === "max_output_tokens" || reason === "max_tokens") return "token_exhausted";
+    if (reason === "content_filter") return "content_filtered";
+    return "incomplete";
+  }
+  if (!normalized.content) return "incomplete";
+  if (responseFormat) {
+    try { JSON.parse(normalized.content); } catch { return "invalid_structured_output"; }
+  }
+  return "success";
 }

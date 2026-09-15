@@ -26,6 +26,9 @@ export const AiTokenUsageTable = (sequelize, Sequelize) => {
       output_tokens: Sequelize.INTEGER,
       reasoning_tokens: Sequelize.INTEGER,
       cached_input_price_per_million: Sequelize.DECIMAL(10, 4),
+      // Application-level result: success | refusal | content_filtered |
+      // incomplete | token_exhausted | invalid_structured_output | provider_error
+      outcome: Sequelize.STRING(32),
 
       model: {
         type: Sequelize.STRING,

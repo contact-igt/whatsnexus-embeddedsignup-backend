@@ -78,7 +78,14 @@ export const recordBillingReconciliation = async (p) => {
       pricing_version: p.pricingVersion ?? null,
       endpoint: p.endpoint || null,
       service_tier: p.serviceTier ?? null,
-      usage: p.usage || null,
+      // sanitised numeric usage only — never prompts / responses / credentials
+      usage: p.usage ? { inputTokens: p.usage.inputTokens ?? null, cachedInputTokens: p.usage.cachedInputTokens ?? null, outputTokens: p.usage.outputTokens ?? null, reasoningTokens: p.usage.reasoningTokens ?? null, totalTokens: p.usage.totalTokens ?? null } : null,
+      raw_usage_summary: p.rawUsageSummary || null,
+      rate_snapshot: p.rateSnapshot || null,
+      markup_snapshot: p.markupSnapshot ?? null,
+      fx_snapshot: p.fxSnapshot ?? null,
+      wallet_stage_reached: p.walletStageReached || null,
+      sanitized_error: typeof p.error === "string" ? p.error.slice(0, 300) : null,
       occurrences: 1,
       last_seen_at: new Date().toISOString(),
     };

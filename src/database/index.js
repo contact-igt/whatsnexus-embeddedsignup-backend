@@ -1,4 +1,4 @@
-import { AiModelCatalogTable, AiModelSyncTable } from "./tables/AiModelCatalogTable/index.js";
+import { AiModelCatalogTable, AiModelSyncTable, AiModelTestAttemptsTable } from "./tables/AiModelCatalogTable/index.js";
 import Sequelize from "sequelize";
 import DatabaseEnvironmentConfig from "../config/database.config.js";
 import ServerEnvironmentConfig from "../config/server.config.js";
@@ -247,6 +247,7 @@ db.AiHandoffEvents = AiHandoffEventsTable(sequelize, Sequelize);
 // Catalog records never own pricing/usage history; no cascading deletes.
 db.AiModelCatalog = AiModelCatalogTable(sequelize, Sequelize);
 db.AiModelSync = AiModelSyncTable(sequelize, Sequelize);
+db.AiModelTestAttempts = AiModelTestAttemptsTable(sequelize, Sequelize);
 defineAssociations(db);
 
 export default db;

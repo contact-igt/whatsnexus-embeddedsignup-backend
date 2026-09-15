@@ -20,6 +20,10 @@ router.get("/", ...read, handler(() => listCatalog()));
 router.post("/sync", ...write, handler(() => syncCatalog()));
 router.put("/:id", ...write, handler((req, actor) => reviewCatalog(req.params.id, req.body, actor)));
 router.post("/:id/test", ...write, handler((req, actor) => testCatalog(req.params.id, req.body, actor)));
-router.post("/:id/activate", ...write, handler((req, actor) => activateCatalog(req.params.id, true, actor)));
+router.post("/:id/activate", ...write, handler((req, actor) => activateCatalog(req.params.id, true, actor, {
+  overrideTenantScopedTest: req.body?.overrideTenantScopedTest === true,
+  overrideReason: req.body?.overrideReason,
+  isSuperAdmin: req.user?.role === "super_admin",
+})));
 router.post("/:id/deactivate", ...write, handler((req, actor) => activateCatalog(req.params.id, false, actor)));
 export default router;

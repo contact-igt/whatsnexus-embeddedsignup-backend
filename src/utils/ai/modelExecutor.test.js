@@ -80,6 +80,8 @@ test("request rejects over-budget output, oversize input, and unapproved feature
   assert.throws(() => buildModelRequest({ model: "gpt-4o", profile: chatProfile({ supportsJsonMode: false }), messages: msgs, maxTokens: 10, responseFormat: { type: "json_object" } }), /JSON mode is not approved/);
   assert.throws(() => buildModelRequest({ model: "gpt-4o", profile: chatProfile({ supportsStructuredOutput: false }), messages: msgs, maxTokens: 10, responseFormat: { type: "json_schema", json_schema: { name: "x", schema: {} } } }), /Structured output is not approved/);
   assert.throws(() => buildModelRequest({ model: "gpt-4o", profile: chatProfile(), messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } }] }], maxTokens: 10 }), /Image input is not approved/);
+  // a user literally typing "image_url" in plain text must NOT trip the guard
+  assert.doesNotThrow(() => buildModelRequest({ model: "gpt-4o", profile: chatProfile(), messages: [{ role: "user", content: 'how do I set "image_url" in the API?' }], maxTokens: 10 }));
 });
 
 test("requestByteSize + unicode boundary", () => {

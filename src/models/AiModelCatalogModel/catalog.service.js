@@ -1,8 +1,11 @@
+import { randomUUID } from "node:crypto";
 import db from "../../database/index.js";
 import { getOpenAIClient } from "../../utils/ai/getOpenAIClient.js";
 import { activationBlockers, matchesApprovedModel, ModelConfigurationError, validateModelId, validateRequestProfile } from "../../utils/ai/modelProfile.js";
-import { confirmModelAccess, credentialFingerprint, invalidateModelAccess, sanitizedProviderError } from "../../utils/ai/modelAccess.js";
+import { confirmModelAccess, credentialFingerprint, invalidateModelAccess, sanitizedProviderError, sanitizeErrorForAdmin } from "../../utils/ai/modelAccess.js";
+import { classifyTestFailure } from "../../utils/ai/testFailureClassifier.js";
 import { executeModel } from "../../utils/ai/modelExecutor.js";
+import { recordHealthEvent } from "../../utils/billing/billingHealthMonitor.js";
 import { getIO } from "../../middlewares/socket/socket.js";
 
 export function invalidateCatalogCaches() {
@@ -11,6 +14,9 @@ export function invalidateCatalogCaches() {
 }
 
 const audit = (actor, action, model, transaction) => db.AdminAuditLog.create({ admin_id: String(actor), action_type: "pricing_update", details: { action, model }, reason: "AI model catalog administration" }, { transaction });
+
+// Guard against duplicate concurrent compatibility tests (each = billable calls).
+const testsInFlight = new Set();
 const plain = row => row?.toJSON ? row.toJSON() : row;
 // JSON columns can come back as strings on some MySQL/MariaDB setups.
 const parseProfile = value => {
@@ -36,12 +42,17 @@ export async function listCatalog() {
     const runtimeBlockers = activationBlockers(model, pricing, { forActivation: false });
     const active = !!pricing?.is_active;
     const legacy = model.test_status === "legacy_grandfathered";
+    // An active model that failed its most recent test is still serving traffic;
+    // surface the warning without pretending it is unavailable.
+    const lastTestFailed = !!model.last_test_failure_class
+      && (!model.last_tested_at || new Date(model.last_test_attempt_at) > new Date(model.last_tested_at));
     const state =
       model.review_status === "retired" ? "Retired"
       : model.review_status === "unsupported" ? "Unsupported"
       : model.lifecycle_status === "shutdown" ? "Unavailable"
       : model.review_status !== "approved" ? "Pending review"
       : !pricing ? "Pricing needed"
+      : active && lastTestFailed ? `Active — last test failed (${model.last_test_failure_class})`
       : active && legacy ? "Active (legacy — not live-tested)"
       : active && !runtimeBlockers.length ? "Active"
       : model.test_status === "failed" ? "Test failed"
@@ -54,6 +65,7 @@ export async function listCatalog() {
       pricing, active, blockers, runtimeBlockers,
       activationReady: !blockers.length,
       is_legacy_grandfathered: legacy,
+      last_test_failed: lastTestFailed,
       state,
     };
   });
@@ -154,66 +166,179 @@ export async function reviewCatalog(id, data, actor) {
   invalidateCatalogCaches();
 }
 
+/**
+ * Run a capped live compatibility test. A test NEVER activates or deactivates a
+ * model. On failure it records an attempt in ai_model_test_attempts and:
+ *   - active model  → keeps it usable (test_status unchanged); definitive
+ *     failures raise a high-severity admin alert and require explicit deactivation.
+ *   - inactive model → a definitive failure sets test_status="failed" (blocks
+ *     activation only); transient/config failures leave test_status alone.
+ * A definitive success sets test_status="passed" (promoting legacy_grandfathered).
+ */
 export async function testCatalog(id, scope, actor) {
   if (!scope || !["platform", "tenant"].includes(scope.credentialScope)) throw new ModelConfigurationError("Choose platform or tenant credential scope.");
   const tenantId = scope.credentialScope === "tenant" ? scope.tenantId : null;
   if (scope.credentialScope === "tenant" && (typeof tenantId !== "string" || !await db.Tenants.findOne({ where: { tenant_id: tenantId, is_deleted: false } }))) throw new ModelConfigurationError("A valid tenant ID is required.");
   const entry = await db.AiModelCatalog.findByPk(id);
   if (!entry) throw new ModelConfigurationError("Model not found.");
-  const profile = validateRequestProfile(entry.request_profile);
-  const reviewedAt = new Date(entry.reviewed_at).getTime();
-  const client = await getOpenAIClient(tenantId);
-  const checks = [];
+
+  const lockKey = `${entry.id}:${scope.credentialScope}:${tenantId || "-"}`;
+  if (testsInFlight.has(lockKey)) throw new ModelConfigurationError("A compatibility test for this model is already running.", "AI_MODEL_TEST_BUSY", 409);
+  testsInFlight.add(lockKey);
   try {
+    return await runTest();
+  } finally {
+    testsInFlight.delete(lockKey);
+  }
+
+  async function runTest() {
+  const correlationId = randomUUID();
+  const startedAt = new Date();
+  const price = await db.AiPricing.findOne({ where: { model: entry.model }, raw: true });
+  const isActive = !!price?.is_active;
+
+  const recordAttempt = (fields) => db.AiModelTestAttempts.create({
+    catalog_id: entry.id, credential_scope: scope.credentialScope, tenant_id: tenantId,
+    started_at: startedAt, completed_at: new Date(), requested_model: entry.model,
+    triggered_by: String(actor), correlation_id: correlationId, ...fields,
+  }).catch(() => {});
+
+  let profile;
+  try {
+    profile = validateRequestProfile(entry.request_profile);
+  } catch (error) {
+    await recordAttempt({ result_status: "failed", failure_class: "configuration", failing_check: "profile", sanitized_error: sanitizeErrorForAdmin(error, "profile") });
+    await db.AiModelCatalog.update({ last_test_attempt_at: new Date(), last_test_failure_class: "configuration", test_error: sanitizeErrorForAdmin(error, "profile") }, { where: { id } });
+    invalidateCatalogCaches();
+    throw new ModelConfigurationError("The reviewed request profile is invalid — fix it before testing.", "AI_MODEL_CONFIGURATION");
+  }
+  const reviewedAt = new Date(entry.reviewed_at).getTime();
+
+  let currentCheck = "access";
+  try {
+    const client = await getOpenAIClient(tenantId).catch(() => { throw new ModelConfigurationError("No usable OpenAI credential for this scope.", "AI_MODEL_ACCESS", 403); });
     await confirmModelAccess(client, tenantId, entry.model, true);
+
     const cases = [{ name: "text", messages: [{ role: "user", content: "Reply with OK." }] }];
-    if (profile.supportsJsonMode) cases.push({ name: "json", messages: [{ role: "user", content: 'Return JSON with key ok and boolean true.' }], responseFormat: { type: "json_object" } });
+    if (profile.supportsJsonMode) cases.push({ name: "json", messages: [{ role: "user", content: "Return JSON with key ok and boolean true." }], responseFormat: { type: "json_object" } });
     if (profile.supportsStructuredOutput) cases.push({ name: "structured", messages: [{ role: "user", content: "Return ok true." }], responseFormat: { type: "json_schema", json_schema: { name: "check", strict: true, schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false } } } });
     if (profile.modalities.includes("image_input")) cases.push({ name: "vision", messages: [{ role: "user", content: [{ type: "text", text: "Name the main color in this image." }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=", detail: "low" } }] }] });
+
+    const checks = [];
     let last;
     for (const check of cases) {
+      currentCheck = check.name;
       last = await executeModel(client, { model: entry.model, profile, maxTokens: Math.min(512, profile.maxOutputTokens), temperature: 0, ...check });
-      if (last.refusal || last.incomplete || !last.content) throw new ModelConfigurationError("Test refused, incomplete, or empty.");
-      if (!matchesApprovedModel(profile, last.actualModel)) throw new ModelConfigurationError("Returned model requires an explicit reviewed pricing mapping.");
-      if (check.responseFormat && JSON.parse(last.content)?.ok !== true) throw new ModelConfigurationError("JSON output test failed.");
+      if (last.refusal || last.incomplete || !last.content) throw new ModelConfigurationError("Test response was refused, incomplete, or empty.", "AI_OUTPUT_INCOMPLETE");
+      if (!matchesApprovedModel(profile, last.actualModel)) throw new ModelConfigurationError("Returned model is not in the approved mapping.", "AI_MODEL_MAPPING");
+      if (check.responseFormat) {
+        let parsed;
+        try { parsed = JSON.parse(last.content); } catch { throw new ModelConfigurationError("Structured-output check returned invalid JSON.", "AI_OUTPUT_INVALID"); }
+        if (parsed?.ok !== true) throw new ModelConfigurationError("Structured-output check did not return { ok: true }.", "AI_OUTPUT_INVALID");
+      }
       checks.push({ name: check.name, passed: true });
     }
-    const result = { success: true, requestedModel: entry.model, actualModel: last.actualModel, endpoint: profile.endpoint, usage: last.usage, checks, warnings: [], credentialScope: scope.credentialScope, tenantId, credentialFingerprint: credentialFingerprint(client) };
-    const [changed] = await db.AiModelCatalog.update({ test_status: "passed", test_error: null, test_result: result, last_tested_at: new Date() }, { where: { id, reviewed_at: entry.reviewed_at } });
-    if (!changed || reviewedAt !== new Date(entry.reviewed_at).getTime()) throw new ModelConfigurationError("Profile changed during test; test again.");
+
+    const result = { success: true, requestedModel: entry.model, actualModel: last.actualModel, endpoint: profile.endpoint, usage: last.usage, checks, warnings: [], credentialScope: scope.credentialScope, tenantId, credentialFingerprint: credentialFingerprint(client), correlationId };
+    const [changed] = await db.AiModelCatalog.update(
+      { test_status: "passed", test_error: null, test_result: result, last_tested_at: new Date(), last_test_attempt_at: new Date(), last_test_failure_class: null },
+      { where: { id, reviewed_at: entry.reviewed_at } },
+    );
+    if (!changed || reviewedAt !== new Date(entry.reviewed_at).getTime()) throw new ModelConfigurationError("Profile changed during the test — review and test again.", "AI_MODEL_CONFIGURATION");
+    await recordAttempt({ result_status: "passed", failing_check: null, actual_model: last.actualModel, test_result: result });
     await audit(actor, "compatibility_test", entry.model);
     invalidateCatalogCaches();
-    const { credentialFingerprint: omitted, ...publicResult } = result;
+    const { credentialFingerprint: _omit, ...publicResult } = result;
     return publicResult;
-  } catch {
-    await db.AiModelCatalog.update({ test_status: "failed", test_error: "Compatibility test failed. Check profile, access, output budget, and exact returned model mapping.", last_tested_at: new Date() }, { where: { id, reviewed_at: entry.reviewed_at } });
+  } catch (error) {
+    const { failureClass } = classifyTestFailure(error, currentCheck);
+    const safe = sanitizeErrorForAdmin(error, currentCheck);
+    await recordAttempt({ result_status: "failed", failure_class: failureClass, failing_check: currentCheck, sanitized_error: safe, actual_model: null });
+
+    // Never set "failed" on a model that is currently serving tenants.
+    const patch = { last_test_attempt_at: new Date(), last_test_failure_class: failureClass, test_error: safe };
+    if (!isActive && failureClass === "definitive") patch.test_status = "failed";
+    await db.AiModelCatalog.update(patch, { where: { id } });
+
+    if (isActive && failureClass === "definitive") {
+      await recordHealthEvent(
+        "billing_failure", null,
+        `AI model "${entry.model}" FAILED a definitive compatibility check while ACTIVE — ${safe}. It is still serving tenants; deactivate it explicitly if the failure is real.`,
+        { area: "ai_model_catalog", model: entry.model, catalog_id: entry.id, failure_class: failureClass, failing_check: currentCheck, correlation_id: correlationId, requires_manual_deactivation: true },
+      ).catch(() => {});
+    }
     invalidateCatalogCaches();
-    throw new ModelConfigurationError("Compatibility test failed. Check profile, access, output budget, and exact returned model mapping.");
+
+    const err = new ModelConfigurationError(safe, error?.code && String(error.code).startsWith("AI_") ? error.code : "AI_MODEL_TEST_FAILED");
+    err.failureClass = failureClass;
+    err.failingCheck = currentCheck;
+    throw err;
   }
+  } // end runTest
 }
 
-export async function activateCatalog(id, active, actor) {
+/**
+ * Activate/deactivate the GLOBAL pricing row for a model.
+ *
+ * Global activation requires a PLATFORM-scoped passing compatibility test — one
+ * tenant's key having access does not prove platform / other-tenant access. A
+ * tenant-scoped pass can only be used with an explicit, audited super-admin
+ * override that carries a written reason.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.overrideTenantScopedTest]
+ * @param {string}  [opts.overrideReason]
+ * @param {boolean} [opts.isSuperAdmin]
+ */
+export async function activateCatalog(id, active, actor, opts = {}) {
   await db.sequelize.transaction(async transaction => {
     const entry = await db.AiModelCatalog.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
     if (!entry) throw new ModelConfigurationError("Model not found.");
     const price = await db.AiPricing.findOne({ where: { model: entry.model }, transaction, lock: transaction.LOCK.UPDATE });
+    let platformAccessVerified = false;
     if (active) {
-      // forActivation:true — a real passed live test is required. A
-      // legacy_grandfathered model cannot be (re)activated from here; run the
-      // compatibility test first.
+      // forActivation:true — a real passed live test is required.
       const blockers = activationBlockers(entry, price, { forActivation: true });
       if (blockers.length) throw new ModelConfigurationError(blockers.join(" "));
       const test = typeof entry.test_result === "string"
         ? (() => { try { return JSON.parse(entry.test_result); } catch { return null; } })()
         : entry.test_result;
       if (!test?.credentialScope) throw new ModelConfigurationError("Run a compatibility test before activating.");
-      const client = await getOpenAIClient(test.tenantId || null);
-      if (credentialFingerprint(client) !== test.credentialFingerprint) throw new ModelConfigurationError("Credential changed; repeat the compatibility test.");
-      await confirmModelAccess(client, test.tenantId, entry.model, true);
+
+      if (test.credentialScope === "platform") {
+        const client = await getOpenAIClient(null);
+        if (credentialFingerprint(client) !== test.credentialFingerprint) throw new ModelConfigurationError("Platform credential changed; repeat the platform-scoped compatibility test.");
+        await confirmModelAccess(client, null, entry.model, true);
+        platformAccessVerified = true;
+      } else {
+        // tenant-scoped test → not sufficient for a GLOBAL activation
+        if (!opts.overrideTenantScopedTest) {
+          throw new ModelConfigurationError("Global activation requires a PLATFORM-scoped passing compatibility test. Run the test with credential scope 'platform', or activate with an explicit override.", "AI_PLATFORM_TEST_REQUIRED", 409);
+        }
+        if (!opts.isSuperAdmin) throw new ModelConfigurationError("Only a super admin may override the platform-test requirement.", "FORBIDDEN", 403);
+        if (typeof opts.overrideReason !== "string" || opts.overrideReason.trim().length < 10) {
+          throw new ModelConfigurationError("An override of the platform-test requirement needs a written reason (min 10 chars).");
+        }
+        // still confirm the tenant credential the test used is unchanged
+        const client = await getOpenAIClient(test.tenantId || null);
+        if (credentialFingerprint(client) !== test.credentialFingerprint) throw new ModelConfigurationError("Credential changed; repeat the compatibility test.");
+        await confirmModelAccess(client, test.tenantId, entry.model, true);
+      }
     }
     if (price) await price.update({ is_active: active }, { transaction });
     await entry.update({ activated_at: active ? new Date() : null, activated_by: String(actor) }, { transaction });
-    await audit(actor, active ? "activate" : "deactivate", entry.model, transaction);
+    await db.AdminAuditLog.create({
+      admin_id: String(actor), action_type: "pricing_update",
+      details: {
+        area: "ai_model_catalog", action: active ? "activate" : "deactivate", model: entry.model,
+        platform_access_verified: active ? platformAccessVerified : null,
+        override_tenant_scoped_test: active && !platformAccessVerified ? true : undefined,
+        override_reason: active && !platformAccessVerified ? opts.overrideReason : undefined,
+      },
+      reason: active && !platformAccessVerified
+        ? `Activation with tenant-scoped test override — platform access NOT verified. Reason: ${opts.overrideReason}`
+        : "AI model catalog administration",
+    }, { transaction });
   });
   invalidateCatalogCaches();
 }

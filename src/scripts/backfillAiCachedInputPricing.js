@@ -114,31 +114,45 @@ export async function backfillCachedInputPricing({ db, apply = false, resolveCon
     versionsAfter[w.model] = w.pricing_version_to;
   }
 
+  const concurrentlyModified = [];
+
   if (apply && writes.length) {
     await db.sequelize.transaction(async transaction => {
       for (const w of writes) {
-        const price = w._price;
+        const staleId = w._price.id;
+        const expectedVersion = w.pricing_version_from;
+        const expectedCached = w.cached_rate != null ? null : Number(w.from_cached_rate); // null-fill vs overwrite
         const targetRate = w.cached_rate ?? w.to_cached_rate;
-        const [affected] = await db.AiPricing.update(
-          { cached_input_price_per_million: targetRate, pricing_version: w.pricing_version_to },
-          {
-            where: resolveConflicts
-              ? { id: price.id }
-              : { id: price.id, cached_input_price_per_million: null }, // idempotency guard for the null-fill path
-            transaction,
-          },
-        );
-        if (!affected && !resolveConflicts) {
-          throw new Error(`Row ${price.model} changed under us (cached rate no longer null). Aborting — re-run.`);
+
+        // Re-read + lock INSIDE the transaction; only write if the row is still
+        // in the state we planned for.
+        const row = await db.AiPricing.findByPk(staleId, { transaction, lock: transaction.LOCK.UPDATE });
+        if (!row) { concurrentlyModified.push({ model: w.model, why: "row deleted" }); continue; }
+        const currentCached = row.cached_input_price_per_million;
+        const currentVersion = Number(row.pricing_version) || 1;
+
+        const stateMatches = Number(currentVersion) === Number(expectedVersion)
+          && (expectedCached === null ? currentCached == null : Number(currentCached) === expectedCached);
+        if (!stateMatches) {
+          concurrentlyModified.push({ model: w.model, why: `expected v${expectedVersion}/cached=${expectedCached ?? "null"} but found v${currentVersion}/cached=${currentCached ?? "null"}` });
+          if (!resolveConflicts) continue;
+          // With --resolve-conflicts we still refuse if the version moved (a real
+          // pricing edit happened); we only tolerate the cached-rate differing.
+          if (Number(currentVersion) !== Number(expectedVersion)) continue;
         }
-        const catalog = w._catalog;
+
+        await row.update(
+          { cached_input_price_per_million: targetRate, pricing_version: db.sequelize.literal("pricing_version + 1") },
+          { transaction },
+        );
+
+        const catalog = await db.AiModelCatalog.findOne({ where: { provider: "openai", model: w.model }, transaction });
         if (catalog) {
           const profile = parseProfile(catalog.request_profile);
           if (profile) {
-            const nextCaps = { ...billingCapabilities(profile), cachedInput: true };
-            await db.AiModelCatalog.update(
-              { request_profile: { ...profile, billingCapabilities: nextCaps } },
-              { where: { id: catalog.id }, transaction },
+            await catalog.update(
+              { request_profile: { ...profile, billingCapabilities: { ...billingCapabilities(profile), cachedInput: true } } },
+              { transaction },
             );
           }
         }
@@ -146,10 +160,13 @@ export async function backfillCachedInputPricing({ db, apply = false, resolveCon
           admin_id: "backfill-script",
           action_type: "pricing_update",
           details: { area: "ai_pricing", action: "cached_input_backfill", model: w.model, cached_rate: targetRate },
-          before_state: { cached_input_price_per_million: price.cached_input_price_per_million, pricing_version: w.pricing_version_from },
-          after_state: { cached_input_price_per_million: targetRate, pricing_version: w.pricing_version_to, billingCapabilities_cachedInput: true },
+          before_state: { cached_input_price_per_million: currentCached, pricing_version: currentVersion },
+          after_state: { cached_input_price_per_million: targetRate, pricing_version: currentVersion + 1, billingCapabilities_cachedInput: true },
           reason: "Backfill reviewed cached-input pricing",
         }, { transaction });
+      }
+      if (concurrentlyModified.length && !resolveConflicts) {
+        throw new Error(`Aborting — ${concurrentlyModified.length} row(s) changed since the dry-run: ${JSON.stringify(concurrentlyModified)}. Re-run.`);
       }
     });
   }
@@ -163,6 +180,7 @@ export async function backfillCachedInputPricing({ db, apply = false, resolveCon
     skipped,
     conflicts,
     blocked,
+    concurrentlyModified,
     versionsBefore,
     versionsAfter,
   };
@@ -190,6 +208,7 @@ function report(env, result, apply) {
   console.log(`\nCHANGED:\n${rows(result.changed)}`);
   console.log(`\nSKIPPED:\n${rows(result.skipped)}`);
   console.log(`\nCONFLICTS:\n${rows(result.conflicts)}`);
+  console.log(`\nCONCURRENTLY MODIFIED (aborted / skipped):\n${rows(result.concurrentlyModified || [])}`);
   console.log(`\nBLOCKED:\n${rows(result.blocked)}`);
   if (result.blocked.length) console.log("\n⚠  Blocked models emit a reconciliation event (no wallet charge) if OpenAI returns cached tokens. Add verified rates to src/config/aiCachedInputPricing.js.");
   if (result.conflicts.length) console.log("\n⚠  Conflicts were NOT written. Investigate the mismatch, then re-run with --resolve-conflicts if the reviewed config is authoritative.");

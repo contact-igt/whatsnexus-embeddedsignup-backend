@@ -68,93 +68,162 @@ const baseResolved = () => ({
   profile: profile(), pricing: price(), client: {},
 });
 
-test("runApprovedModel: charges once, snapshots exact pricing_version, no double reasoning", async () => {
+// raw chat-completions shape (executeProviderRequest returns the RAW response)
+const rawChat = ({ content = "answer", finish = "stop", refusal = null, model = "gpt-4o-2024-08-06", usage, service_tier } = {}) => ({
+  model, service_tier,
+  choices: [{ finish_reason: finish, message: { content, refusal } }],
+  usage: usage ?? { prompt_tokens: 1000, completion_tokens: 300, total_tokens: 1300, prompt_tokens_details: { cached_tokens: 200 }, completion_tokens_details: { reasoning_tokens: 120 } },
+});
+const run = (body, deps) => runApprovedModel({ tenantId: "TT1", purpose: "output", source: "whatsapp", messages: [{ role: "user", content: "hi" }], maxTokens: 100, ...body }, deps);
+
+test("runApprovedModel: charges once, snapshots pricing_version, tags outcome, no double reasoning", async () => {
   const tracked = [];
-  const out = await runApprovedModel(
-    { tenantId: "TT1", purpose: "output", source: "whatsapp", messages: [{ role: "user", content: "hi" }], maxTokens: 100 },
-    {
-      resolveModel: async () => baseResolved(),
-      executeModel: async () => ({
-        content: "answer", refusal: null, incomplete: false, endpoint: CHAT, actualModel: "gpt-4o-2024-08-06",
-        rawResponse: { service_tier: "default" },
-        usage: { inputTokens: 1000, cachedInputTokens: 200, outputTokens: 300, reasoningTokens: 120, totalTokens: 1300 },
-      }),
-      trackAiTokenUsage: async (t, s, resp, ctx) => tracked.push(ctx),
-      recordBillingReconciliation: async () => { throw new Error("should not reconcile a chargeable request"); },
-    },
-  );
+  const out = await run({}, {
+    resolveModel: async () => baseResolved(),
+    executeProviderRequest: async () => rawChat({ service_tier: "default" }),
+    trackAiTokenUsage: async (t, s, resp, ctx) => tracked.push(ctx),
+    recordBillingReconciliation: async () => { throw new Error("should not reconcile a chargeable request"); },
+  });
   assert.equal(out.content, "answer");
+  assert.equal(out.outcome, "success");
   assert.equal(tracked.length, 1);
   assert.equal(tracked[0].pricing.pricing_version, 4);
   assert.equal(tracked[0].actualModelMapping, "gpt-4o");
+  assert.equal(tracked[0].outcome, "success");
   assert.equal(tracked[0].usage.reasoningTokens, 120);
-  assert.equal(tracked[0].usage.outputTokens, 300); // reasoning already inside output
+  assert.equal(tracked[0].usage.outputTokens, 300);
 });
 
-test("runApprovedModel: unmapped actual model → reconciliation event, NO wallet charge, throws", async () => {
+test("runApprovedModel: the REAL runtime passes cacheCapable:true — missing cached rate blocks before the provider call", async () => {
+  let called = false;
+  await assert.rejects(
+    run({}, {
+      resolveModel: async () => ({ ...baseResolved(), profile: profile({ billingCapabilities: { ...profile().billingCapabilities, cachedInput: false } }), pricing: price({ cached_input_price_per_million: null }) }),
+      executeProviderRequest: async () => { called = true; return rawChat(); },
+    }),
+    (e) => e.code === "AI_TARIFF_UNSUPPORTED" && e.reason === "CACHED_INPUT_RATE_MISSING",
+  );
+  assert.equal(called, false, "cacheCapable:true is enforced even when the profile flag is false");
+});
+
+test("runApprovedModel: unmapped actual model → one reconciliation event, NO charge, throws", async () => {
   const events = [];
   await assert.rejects(
-    runApprovedModel(
-      { tenantId: "TT1", purpose: "output", source: "whatsapp", messages: [{ role: "user", content: "hi" }], maxTokens: 100 },
-      {
-        resolveModel: async () => baseResolved(),
-        executeModel: async () => ({
-          content: "x", refusal: null, incomplete: false, endpoint: CHAT, actualModel: "gpt-4o-mini",
-          rawResponse: {}, usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
-        }),
-        trackAiTokenUsage: async () => { throw new Error("must not charge"); },
-        recordBillingReconciliation: async (e) => events.push(e),
-      },
-    ),
+    run({}, {
+      resolveModel: async () => baseResolved(),
+      executeProviderRequest: async () => rawChat({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }),
+      trackAiTokenUsage: async () => { throw new Error("must not charge"); },
+      recordBillingReconciliation: async (e) => events.push(e),
+    }),
     (e) => e.code === "AI_BILLING_RECONCILIATION",
   );
   assert.equal(events.length, 1);
   assert.equal(events[0].reason, "unmapped_actual_model");
   assert.equal(events[0].pricingVersion, 4);
+  assert.ok(events[0].correlationId);
 });
 
-test("runApprovedModel: cached tokens with a configured cached rate charge normally", async () => {
-  let charged = false;
-  await runApprovedModel(
-    { tenantId: "TT1", purpose: "output", source: "whatsapp", messages: [{ role: "user", content: "hi" }], maxTokens: 100 },
-    {
-      resolveModel: async () => baseResolved(),
-      executeModel: async () => ({
-        content: "ok", refusal: null, incomplete: false, endpoint: CHAT, actualModel: "gpt-4o",
-        rawResponse: { service_tier: "default" },
-        usage: { inputTokens: 2000, cachedInputTokens: 1500, outputTokens: 10, reasoningTokens: 0, totalTokens: 2010 },
-      }),
-      trackAiTokenUsage: async () => { charged = true; },
-      recordBillingReconciliation: async () => { throw new Error("should not reconcile"); },
-    },
-  );
-  assert.equal(charged, true);
-});
-
-test("runApprovedModel: preflight blocks when cached capability has no cached rate (before any provider call)", async () => {
-  let executed = false;
+test("runApprovedModel: invalid provider usage → reconciliation (invalid_usage_structure), no charge", async () => {
+  const events = [];
   await assert.rejects(
-    runApprovedModel(
-      { tenantId: "TT1", purpose: "output", source: "whatsapp", messages: [{ role: "user", content: "hi" }], maxTokens: 100 },
-      {
-        resolveModel: async () => ({ ...baseResolved(), pricing: price({ cached_input_price_per_million: null }) }),
-        executeModel: async () => { executed = true; return {}; },
-      },
-    ),
-    (e) => e.code === "AI_TARIFF_UNSUPPORTED" && e.reason === "CACHED_INPUT_RATE_MISSING",
+    run({}, {
+      resolveModel: async () => baseResolved(),
+      // cached > input → normalizeUsage throws
+      executeProviderRequest: async () => rawChat({ usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7, prompt_tokens_details: { cached_tokens: 999 } } }),
+      trackAiTokenUsage: async () => { throw new Error("must not charge"); },
+      recordBillingReconciliation: async (e) => events.push(e),
+    }),
+    (e) => e.code === "AI_BILLING_RECONCILIATION",
   );
-  assert.equal(executed, false, "no provider request when the tariff is not ready");
+  assert.equal(events[0].reason, "invalid_usage_structure");
+  assert.ok(events[0].rawUsageSummary, "raw usage summary captured");
+  assert.ok(!("prompt" in events[0]) && !("messages" in events[0]));
+});
+
+test("runApprovedModel: token-tracking failure → reconciliation + controlled billing error (no free call)", async () => {
+  const events = [];
+  await assert.rejects(
+    run({}, {
+      resolveModel: async () => baseResolved(),
+      executeProviderRequest: async () => rawChat({ service_tier: "default" }),
+      trackAiTokenUsage: async () => { throw new Error("wallet deadlock timeout"); },
+      recordBillingReconciliation: async (e) => events.push(e),
+    }),
+    (e) => e.code === "AI_BILLING_RECONCILIATION",
+  );
+  assert.equal(events.length, 1);
+});
+
+test("runApprovedModel: reconciliation from tracking is not double-reported", async () => {
+  const events = [];
+  await assert.rejects(
+    run({}, {
+      resolveModel: async () => baseResolved(),
+      executeProviderRequest: async () => rawChat({ service_tier: "default" }),
+      trackAiTokenUsage: async () => { const e = new Error("x"); e.code = "AI_BILLING_RECONCILIATION"; throw e; },
+      recordBillingReconciliation: async (e) => events.push(e),
+    }),
+    (e) => e.code === "AI_BILLING_RECONCILIATION",
+  );
+  assert.equal(events.length, 0, "trackAiTokenUsage already recorded it");
+});
+
+// ─── unsuccessful-response billing policy (M8) ──────────────────────────────
+
+for (const [name, raw, expectedOutcome] of [
+  ["refusal", rawChat({ content: "", refusal: "I can't help with that", usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 } }), "refusal"],
+  ["token exhaustion", rawChat({ content: "half", finish: "length", usage: { prompt_tokens: 10, completion_tokens: 100, total_tokens: 110 } }), "token_exhausted"],
+  ["content filter", rawChat({ content: "", finish: "content_filter", usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 } }), "content_filtered"],
+]) {
+  test(`billing policy: ${name} is charged ONCE, tagged "${expectedOutcome}", and returns a controlled error`, async () => {
+    const tracked = [];
+    await assert.rejects(
+      run({}, {
+        resolveModel: async () => baseResolved(),
+        executeProviderRequest: async () => raw,
+        trackAiTokenUsage: async (t, s, resp, ctx) => tracked.push(ctx),
+        recordBillingReconciliation: async () => { throw new Error("valid usage → no reconciliation"); },
+      }),
+      (e) => e.code === "AI_OUTPUT_INCOMPLETE",
+    );
+    assert.equal(tracked.length, 1, "charged exactly once");
+    assert.equal(tracked[0].outcome, expectedOutcome);
+  });
+}
+
+test("billing policy: valid usage + invalid JSON is charged once, tagged, controlled error", async () => {
+  const tracked = [];
+  await assert.rejects(
+    run({ responseFormat: { type: "json_object" } }, {
+      resolveModel: async () => baseResolved(),
+      executeProviderRequest: async () => rawChat({ content: "not json", usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 } }),
+      trackAiTokenUsage: async (t, s, resp, ctx) => tracked.push(ctx),
+      recordBillingReconciliation: async () => { throw new Error("no reconciliation"); },
+    }),
+    (e) => e.code === "AI_OUTPUT_INVALID",
+  );
+  assert.equal(tracked.length, 1);
+  assert.equal(tracked[0].outcome, "invalid_structured_output");
+});
+
+test("runApprovedModel: provider transport error → AI_PROVIDER_ERROR, no charge, no reconciliation", async () => {
+  await assert.rejects(
+    run({}, {
+      resolveModel: async () => baseResolved(),
+      executeProviderRequest: async () => { const e = new Error("socket hang up"); e.status = 503; throw e; },
+      trackAiTokenUsage: async () => { throw new Error("no charge"); },
+      recordBillingReconciliation: async () => { throw new Error("no reconciliation — OpenAI billed nothing"); },
+    }),
+    (e) => e.code === "AI_PROVIDER_ERROR",
+  );
 });
 
 test("runApprovedModel: no tenant → no billing calls at all", async () => {
-  const out = await runApprovedModel(
-    { tenantId: null, purpose: "output", source: "playground", messages: [{ role: "user", content: "hi" }], maxTokens: 50 },
-    {
-      resolveModel: async () => baseResolved(),
-      executeModel: async () => ({ content: "hi there", refusal: null, incomplete: false, endpoint: CHAT, actualModel: "gpt-4o", rawResponse: {}, usage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, reasoningTokens: 0, totalTokens: 2 } }),
-      trackAiTokenUsage: async () => { throw new Error("no tenant → no tracking"); },
-      recordBillingReconciliation: async () => { throw new Error("no tenant → no reconciliation"); },
-    },
-  );
+  const out = await run({ tenantId: null, source: "playground" }, {
+    resolveModel: async () => baseResolved(),
+    executeProviderRequest: async () => rawChat({ content: "hi there", model: "gpt-4o", usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }),
+    trackAiTokenUsage: async () => { throw new Error("no tenant → no tracking"); },
+    recordBillingReconciliation: async () => { throw new Error("no tenant → no reconciliation"); },
+  });
   assert.equal(out.content, "hi there");
 });

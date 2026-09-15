@@ -1,12 +1,10 @@
 import db from "../../database/index.js";
 import { getOpenAIClient } from "./getOpenAIClient.js";
 import { activationBlockers, ModelConfigurationError, validateModelId, validateRequestProfile } from "./modelProfile.js";
-import { confirmModelAccess } from "./modelAccess.js";
+import { confirmModelAccess, listAccessibleModels } from "./modelAccess.js";
+import { DEFAULT_MODELS } from "../../config/aiDefaults.js";
 
-// Existing platform defaults. Kept intentionally so a deployment does not change
-// what any tenant is already using. These must be grandfathered into the catalog
-// (approved + priced + tested) before they can execute.
-export const DEFAULT_MODELS = { input: "gpt-4o-mini", output: "gpt-4o", vision: "gpt-4o" };
+export { DEFAULT_MODELS };
 
 const parseSettings = value => {
   if (!value) return {};
@@ -30,7 +28,7 @@ const fallbackKey = purpose => `${purpose}_fallback_model`;
  *   (used when a tenant is choosing/reassigning a model, not for existing runtime)
  */
 export async function eligibleModel(model, purpose, tenantId, opts = {}) {
-  const { client: suppliedClient, skipAccessCheck = false, requireLiveTest = false } = opts;
+  const { client: suppliedClient, skipAccessCheck = false, requireLiveTest = false, accessibleSet } = opts;
   validateModelId(model);
   if (!["input", "output", "vision"].includes(purpose)) throw new ModelConfigurationError("Invalid model purpose.");
   const [catalog, pricing] = await Promise.all([
@@ -50,7 +48,15 @@ export async function eligibleModel(model, purpose, tenantId, opts = {}) {
     } catch {
       throw new ModelConfigurationError("No usable OpenAI credential is configured for this scope.", "AI_MODEL_ACCESS", 403);
     }
-    await confirmModelAccess(client, tenantId, model);
+    if (accessibleSet instanceof Set) {
+      // membership from a single models.list() — used by the listing endpoint
+      if (!accessibleSet.has(model)) throw new ModelConfigurationError("Model access could not be confirmed for this credential.", "AI_MODEL_ACCESS", 403);
+    } else if (accessibleSet === null) {
+      // provider list was unavailable — availability is unknown, not confirmed
+      throw new ModelConfigurationError("Model availability could not be confirmed.", "AI_MODEL_ACCESS_UNKNOWN", 503);
+    } else {
+      await confirmModelAccess(client, tenantId, model);
+    }
   }
   return { model, catalog, pricing: Object.freeze({ ...pricing }), profile, client };
 }
@@ -96,9 +102,15 @@ export async function availableModels(tenantId, purpose = "output") {
   ]);
   const settings = parseSettings(tenant?.ai_settings);
   const savedSelection = settings[selectionKey(purpose)] || (purpose === "vision" ? settings.output_model : null) || null;
+
+  // ONE models.list() call for the whole listing (not one retrieve() per model).
+  // `accessibleSet` is a Set of accessible ids, or null when the provider list
+  // is temporarily unavailable (→ availability "unknown", never "accessible").
   let client = null;
+  let accessibleSet;
   if (tenantId) {
     try { client = await getOpenAIClient(tenantId); } catch { client = null; }
+    accessibleSet = client ? await listAccessibleModels(client, tenantId) : null;
   }
 
   const shape = (price, eligible, extra = {}) => ({
@@ -126,14 +138,15 @@ export async function availableModels(tenantId, purpose = "output") {
   let savedEntry = null;
   for (const price of prices) {
     try {
-      const eligible = await eligibleModel(price.model, purpose, tenantId, { client });
+      const eligible = await eligibleModel(price.model, purpose, tenantId, { client, accessibleSet });
       const entry = shape(price, eligible, { is_saved_selection: price.model === savedSelection });
       models.push(entry);
       if (price.model === savedSelection) savedEntry = entry;
     } catch (error) {
       if (!(error instanceof ModelConfigurationError)) throw error;
       if (price.model === savedSelection) {
-        savedEntry = { ...shape(price, null, { is_saved_selection: true }), availability: "unavailable", unavailability_reason: error.message };
+        const safe = tenantSafeAvailability(error);
+        savedEntry = { ...shape(price, null, { is_saved_selection: true }), availability: safe.availability, unavailability_reason: safe.message, unavailability_code: safe.code };
       }
     }
   }
@@ -145,9 +158,34 @@ export async function availableModels(tenantId, purpose = "output") {
       modalities: null, lifecycle_status: null, input_rate: null, output_rate: null,
       cached_input_price_per_million: null, usd_to_inr_rate: null, input_rate_inr: null, output_rate_inr: null,
       pricing_version: null, availability: "unavailable", is_saved_selection: true,
+      unavailability_code: "MODEL_UNAVAILABLE",
       unavailability_reason: "This model is no longer offered. Choose a replacement.",
     };
   }
 
   return { models, saved_selection: savedSelection, saved_selection_entry: savedEntry, purpose };
+}
+
+/**
+ * Tenant-facing availability mapper — NEVER leaks internal blockers, pricing
+ * versions, credential resolution order, DB state, or raw exception messages.
+ * The detail stays in server logs / admin APIs.
+ */
+export function tenantSafeAvailability(error) {
+  switch (error?.code) {
+    case "AI_MODEL_ACCESS":
+      return { availability: "unavailable", code: "MODEL_NOT_AVAILABLE_FOR_ACCOUNT", message: "This model isn't available for your account right now." };
+    case "AI_MODEL_ACCESS_UNKNOWN":
+      return { availability: "unknown", code: "MODEL_AVAILABILITY_UNKNOWN", message: "Model availability could not be confirmed. Try again shortly." };
+    case "AI_TARIFF_UNSUPPORTED":
+    case "AI_MODEL_CONFIGURATION":
+      return { availability: "unavailable", code: "MODEL_CONFIGURATION_INCOMPLETE", message: "This model is temporarily unavailable." };
+    case "AI_MODEL_PURPOSE":
+    case "AI_MODEL_MODALITY":
+      return { availability: "unavailable", code: "MODEL_NOT_SUPPORTED_HERE", message: "This model can't be used for this setting." };
+    case "AI_MODEL_UNAVAILABLE":
+      return { availability: "unavailable", code: "MODEL_UNAVAILABLE", message: "This model is currently unavailable." };
+    default:
+      return { availability: "unknown", code: "MODEL_AVAILABILITY_UNKNOWN", message: "Model availability could not be confirmed." };
+  }
 }

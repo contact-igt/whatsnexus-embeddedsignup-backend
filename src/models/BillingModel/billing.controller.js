@@ -282,6 +282,8 @@ export const getAvailableAiModelsController = async (req, res) => {
     if (!management && !tenantId) return res.status(403).json({ success: false, message: "Tenant required" });
     const purpose = req.query.purpose || "output";
     if (!["input", "output", "vision"].includes(purpose)) return res.status(400).json({ success: false, message: "Invalid purpose" });
+    // Management call with no tenant_id → explicitly a PLATFORM-scoped list.
+    const scope = tenantId ? "tenant" : "platform";
     const result = await getAvailableAiModelsService(tenantId, purpose);
     // `data` stays an array for backward compatibility; the saved-but-unavailable
     // selection is surfaced separately in `meta` (spec §11 — never silently swap).
@@ -289,6 +291,7 @@ export const getAvailableAiModelsController = async (req, res) => {
       success: true,
       data: result.models,
       meta: {
+        scope,
         purpose: result.purpose,
         saved_selection: result.saved_selection,
         saved_selection_entry: result.saved_selection_entry,
