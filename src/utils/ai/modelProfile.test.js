@@ -171,6 +171,12 @@ test("activationBlockers: activation vs runtime, legacy_grandfathered", () => {
   // billing readiness folded into blockers
   const cachedNoRate = { ...passed, request_profile: chatProfile({ billingCapabilities: { cachedInput: true } }) };
   assert.ok(activationBlockers(cachedNoRate, validPrice({ cached_input_price_per_million: null }), { forActivation: true }).some(b => /cached-input rate/i.test(b)));
+  const catalogFlagFalseNoRate = { ...passed, request_profile: chatProfile({ billingCapabilities: { cachedInput: false } }) };
+  assert.ok(
+    activationBlockers(catalogFlagFalseNoRate, validPrice({ cached_input_price_per_million: null }), { forActivation: true })
+      .some(b => /cached-input rate/i.test(b)),
+    "activation must enforce the same automatic-cache rule as runtime",
+  );
 
   assert.ok(activationBlockers({ ...passed, review_status: "pending" }, validPrice(), { forActivation: true }).length);
   assert.ok(activationBlockers({ ...passed, lifecycle_status: "shutdown" }, validPrice(), { forActivation: true }).length);

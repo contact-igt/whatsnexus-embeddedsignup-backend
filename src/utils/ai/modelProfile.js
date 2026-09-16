@@ -259,7 +259,11 @@ export function activationBlockers(catalog, price, opts = {}) {
   try { profile = validateRequestProfile(catalog.request_profile); } catch (error) { blockers.push(error.message); }
   try { validatePricing(price); } catch (error) { blockers.push(error.message); }
   if (profile && price) {
-    try { assertBillingReadiness(profile, price); } catch (error) { blockers.push(error.message); }
+    // Runtime treats every supported OpenAI request as cache-capable because
+    // the provider may apply prompt caching automatically. Activation and the
+    // rollout checker must enforce that same rule, otherwise a model can pass
+    // preflight and then fail every live request.
+    try { assertBillingReadiness(profile, price, { cacheCapable: true }); } catch (error) { blockers.push(error.message); }
   }
   const okStatuses = forActivation ? ACTIVATABLE_TEST_STATUSES : RUNTIME_OK_TEST_STATUSES;
   if (!okStatuses.has(catalog.test_status)) {

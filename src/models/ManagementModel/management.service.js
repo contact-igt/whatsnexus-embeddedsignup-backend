@@ -423,6 +423,12 @@ export const updateAiPricingRuleService = async (id, data, actor = null) => {
     const before = rule.toJSON();
     const fields = ["input_rate", "output_rate", "cached_input_price_per_million", "markup_percent", "usd_to_inr_rate", "description", "recommended_for", "category", "is_active"];
     const update = Object.fromEntries(fields.filter(field => data[field] !== undefined).map(field => [field, data[field]]));
+    const cachedRate = update.cached_input_price_per_million === undefined
+      ? rule.cached_input_price_per_million
+      : update.cached_input_price_per_million;
+    if (rule.is_active && update.is_active !== false && cachedRate == null) {
+      throw new ModelConfigurationError("Cached-input rate is required while this model is active. Deactivate it before clearing the rate.");
+    }
     validatePricing({ ...before, ...update });
     const billable = ["input_rate", "output_rate", "cached_input_price_per_million", "markup_percent", "usd_to_inr_rate"];
     if (billable.some(field => data[field] !== undefined && String(data[field]) !== String(rule[field]))) update.pricing_version = Number(rule.pricing_version) + 1;
