@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import db from "../../database/index.js";
 import { getOpenAIClient } from "../../utils/ai/getOpenAIClient.js";
+import { VISION_TEST_IMAGE_DATA_URL } from "../../utils/ai/testFixtures.js";
 import { activationBlockers, matchesApprovedModel, ModelConfigurationError, validateModelId, validateRequestProfile } from "../../utils/ai/modelProfile.js";
 import { confirmModelAccess, credentialFingerprint, invalidateModelAccess, sanitizedProviderError, sanitizeErrorForAdmin } from "../../utils/ai/modelAccess.js";
 import { classifyTestFailure } from "../../utils/ai/testFailureClassifier.js";
@@ -25,6 +26,15 @@ const parseProfile = value => {
   return null;
 };
 
+/**
+ * "Can this model be switched ON?" must be judged against the pricing rule as it WILL be once
+ * activated. An inactive rule is the normal, expected state BEFORE activation — treating it as a
+ * blocker made activation impossible ("Pricing rule is not active." on a model showing
+ * "Ready to activate"). Only the runtime path may reject an inactive rule, and it does so by
+ * querying `is_active: true` itself, so this does not weaken it.
+ */
+const asActivatedPrice = price => (price ? { ...plain(price), is_active: true } : price);
+
 export async function listCatalog() {
   const [models, prices, latestSync, latestSuccess] = await Promise.all([
     db.AiModelCatalog.findAll({ order: [["model", "ASC"]], raw: true }),
@@ -36,7 +46,7 @@ export async function listCatalog() {
   const entries = models.map(model => {
     const pricing = pricingMap.get(model.model) || null;
     // "blockers" = what stops a FRESH activation (needs a real passed test).
-    const blockers = activationBlockers(model, pricing, { forActivation: true });
+    const blockers = activationBlockers(model, asActivatedPrice(pricing), { forActivation: true });
     // "runtimeBlockers" = what would stop a model that is already active
     // (legacy_grandfathered is acceptable here).
     const runtimeBlockers = activationBlockers(model, pricing, { forActivation: false });
@@ -145,6 +155,13 @@ export async function syncCatalog() {
 }
 
 export async function reviewCatalog(id, data, actor) {
+  // An empty object is "no profile supplied", not a profile: otherwise it reaches the validator and
+  // fails with a misleading "Unsupported endpoint." instead of "A reviewed request profile is required."
+  if (data && typeof data.request_profile === "object" && data.request_profile !== null
+    && !Array.isArray(data.request_profile) && Object.keys(data.request_profile).length === 0) {
+    const { request_profile: _empty, ...rest } = data;
+    data = rest;
+  }
   const allowed = ["review_status", "request_profile", "lifecycle_status"];
   if (Object.keys(data).some(key => !allowed.includes(key))) throw new ModelConfigurationError("Unsupported catalog update field.");
   if (data.review_status !== undefined && !["pending", "approved", "unsupported", "retired"].includes(data.review_status)) throw new ModelConfigurationError("Invalid review status.");
@@ -222,7 +239,7 @@ export async function testCatalog(id, scope, actor) {
     const cases = [{ name: "text", messages: [{ role: "user", content: "Reply with OK." }] }];
     if (profile.supportsJsonMode) cases.push({ name: "json", messages: [{ role: "user", content: "Return JSON with key ok and boolean true." }], responseFormat: { type: "json_object" } });
     if (profile.supportsStructuredOutput) cases.push({ name: "structured", messages: [{ role: "user", content: "Return ok true." }], responseFormat: { type: "json_schema", json_schema: { name: "check", strict: true, schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false } } } });
-    if (profile.modalities.includes("image_input")) cases.push({ name: "vision", messages: [{ role: "user", content: [{ type: "text", text: "Name the main color in this image." }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=", detail: "low" } }] }] });
+    if (profile.modalities.includes("image_input")) cases.push({ name: "vision", messages: [{ role: "user", content: [{ type: "text", text: "Name the main color in this image." }, { type: "image_url", image_url: { url: VISION_TEST_IMAGE_DATA_URL, detail: "low" } }] }] });
 
     const checks = [];
     let last;
@@ -298,7 +315,7 @@ export async function activateCatalog(id, active, actor, opts = {}) {
     let platformAccessVerified = false;
     if (active) {
       // forActivation:true — a real passed live test is required.
-      const blockers = activationBlockers(entry, price, { forActivation: true });
+      const blockers = activationBlockers(entry, asActivatedPrice(price), { forActivation: true });
       if (blockers.length) throw new ModelConfigurationError(blockers.join(" "));
       const test = typeof entry.test_result === "string"
         ? (() => { try { return JSON.parse(entry.test_result); } catch { return null; } })()

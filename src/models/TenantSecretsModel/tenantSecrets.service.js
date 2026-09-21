@@ -6,7 +6,7 @@ import { encryptSecret, decryptSecret } from "../../utils/encryption.js";
  * Encrypt and upsert a secret for a tenant.
  * Each (tenant_id, type) pair stores exactly one secret — updates in place.
  */
-export const storeSecret = async (tenant_id, type, plaintext) => {
+export const storeSecret = async (tenant_id, type, plaintext, { transaction } = {}) => {
   const encrypted = encryptSecret(plaintext, tenant_id);
   if (!encrypted) throw new Error("Encryption failed: empty plaintext");
 
@@ -29,6 +29,7 @@ export const storeSecret = async (tenant_id, type, plaintext) => {
         encrypted.auth_tag,
         encrypted.key_version,
       ],
+      ...(transaction ? { transaction } : {}),
     },
   );
   if (type === "openai") { const { invalidateOpenAIClient } = await import("../../utils/ai/getOpenAIClient.js"); invalidateOpenAIClient(tenant_id); }

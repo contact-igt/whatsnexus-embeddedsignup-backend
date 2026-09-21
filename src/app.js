@@ -48,6 +48,7 @@ import CoursesRouter from "./models/CoursesModel/courses.routes.js";
 import MentorsRouter from "./models/MentorsModel/mentors.routes.js";
 import TenantFeatureAccessTenantRouter from "./models/TenantFeatureAccessModel/tenantFeatureAccess.tenant.routes.js";
 import TenantFeatureAccessManagementRouter from "./models/TenantFeatureAccessModel/tenantFeatureAccess.management.routes.js";
+import WhatsappCapabilitiesManagementRouter from "./models/WhatsappAccountModel/whatsappCapabilities.management.routes.js";
 import ModuleAccessTenantRouter from "./models/ModuleAccessModel/moduleAccess.tenant.routes.js";
 import ModuleAccessManagementRouter from "./models/ModuleAccessModel/moduleAccess.management.routes.js";
 import { checkHealthAlerts } from "./utils/billing/billingHealthMonitor.js";
@@ -133,6 +134,7 @@ app.use(
   ManagementRouter,
 );
 app.use("/api/management", TenantFeatureAccessManagementRouter);
+app.use("/api/management", WhatsappCapabilitiesManagementRouter);
 
 app.use("/api/tenant", TenantFeatureAccessTenantRouter);
 app.use("/api/tenant", ModuleAccessTenantRouter);
@@ -232,6 +234,8 @@ app.use((err, req, res, next) => {
         await db.sequelize.authenticate();
         const { assertCatalogSchema } = await import("./utils/ai/catalogSchemaPreflight.js");
         await assertCatalogSchema(db, { fatal: true });
+        const { assertWhatsappEmbeddedSchema } = await import("./utils/whatsappEmbeddedSchemaPreflight.js");
+        await assertWhatsappEmbeddedSchema(db, { fatal: true });
       }
 
       const [, cleanupMeta] = await db.sequelize.query(

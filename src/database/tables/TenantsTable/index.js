@@ -221,6 +221,20 @@ export const TenantsTable = (sequelize, Sequelize) => {
         allowNull: true,
       },
 
+      // WhatsApp onboarding capabilities (Super Admin controlled). Default OFF so
+      // existing organizations keep the manual-only WhatsApp Settings experience.
+      embedded_signup_enabled: {
+        type: Sequelize.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
+
+      coexistence_enabled: {
+        type: Sequelize.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
+
       createdAt: {
         type: Sequelize.DATE,
         allowNull: false,

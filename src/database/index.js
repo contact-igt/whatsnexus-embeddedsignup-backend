@@ -23,6 +23,8 @@ import { WhatsappTemplateComponentTable } from "./tables/WhatsappTemplateCompone
 import { WhatsappTemplateVariableTable } from "./tables/WhatsappTemplateVariablesTable/index.js";
 import { WhatsappTemplateSyncLogTable } from "./tables/WhatsappTemplateSyncLogsTable/index.js";
 import { WhatsappAccountTable } from "./tables/WhatsappAccountTable/index.js";
+import { WhatsappNumberIdentityTable } from "./tables/WhatsappNumberIdentityTable/index.js";
+import { WhatsappOnboardingSessionTable } from "./tables/WhatsappOnboardingSessionTable/index.js";
 import { WhatsappCampaignTable } from "./tables/WhatsappCampaignTable/index.js";
 import { WhatsappCampaignRecipientTable } from "./tables/WhatsappCampaignRecipientTable/index.js";
 import { CampaignEventsTable } from "./tables/CampaignEventsTable/index.js";
@@ -161,6 +163,8 @@ db.WhatsappCampaignRecipients = WhatsappCampaignRecipientTable(
 db.CampaignEvents = CampaignEventsTable(sequelize, Sequelize);
 
 db.Whatsappaccount = WhatsappAccountTable(sequelize, Sequelize);
+db.WhatsappNumberIdentity = WhatsappNumberIdentityTable(sequelize, Sequelize);
+db.WhatsappOnboardingSession = WhatsappOnboardingSessionTable(sequelize, Sequelize);
 db.KnowledgeSources = KnowledgeSourcesTable(sequelize, Sequelize);
 db.KnowledgeChunks = KnowledgeChunksTable(sequelize, Sequelize);
 db.AiPrompt = AiPromptTable(sequelize, Sequelize);

@@ -118,6 +118,8 @@ import {
   shouldDiscardAutomatedReply,
 } from "../../services/repeatedMessageGuard.service.js";
 import { dispatchHandoffForPause } from "../../services/aiHandoffOutbox.service.js";
+import { ECHO_FIELD } from "./coexistenceEcho.core.js";
+import { processCoexistenceEchoes } from "./coexistenceEcho.service.js";
 
 const FIXED_MISSING_INFO_FALLBACK = MISSING_INFO_FALLBACK_REPLY;
 
@@ -275,6 +277,17 @@ export const receiveMessage = async (req, res) => {
     const field = change?.field;
     const msg = value?.messages?.[0];
     const statusUpdate = value?.statuses?.[0];
+
+    // Business-App coexistence: messages the business sent from the WhatsApp
+    // Business App. Isolated handler — it only acts on EMBEDDED_COEXISTENCE
+    // accounts, so legacy manual clients never reach any of its logic.
+    if (field === ECHO_FIELD) {
+      await processCoexistenceEchoes({
+        body: req.body,
+        urlTenantId: req.params?.tenantId,
+      });
+      return res.sendStatus(200);
+    }
 
     // FIX 5 — both webhooks carry a messaging-capability / tier change.
     // `phone_number_quality_update` also carries quality_rating.

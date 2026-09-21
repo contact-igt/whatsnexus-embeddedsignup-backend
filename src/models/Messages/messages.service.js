@@ -1,5 +1,6 @@
 import db from "../../database/index.js";
 import { tableNames } from "../../database/tableName.js";
+import { getHistoryScope } from "../WhatsappAccountModel/whatsappNumberScope.service.js";
 import { AiService } from "../../utils/ai/coreAi.js";
 import { processResponse } from "../../utils/ai/aiTagHandlers/index.js";
 import { searchKnowledgeChunks } from "../Knowledge/knowledge.search.js";
@@ -104,6 +105,8 @@ export const createUserMessageService = async (
 };
 
 export const getChatListService = async (tenant_id, limit = 200) => {
+  // Empty (query unchanged) unless the org switched to a different business number.
+  const scope = await getHistoryScope(tenant_id);
   const dataQuery = `
   SELECT
     m.contact_id,
@@ -124,7 +127,7 @@ export const getChatListService = async (tenant_id, limit = 200) => {
       MAX(created_at) AS last_message_time,
       MAX(id) AS last_message_id
     FROM messages
-    WHERE tenant_id = ? AND is_deleted = false
+    WHERE tenant_id = ? AND is_deleted = false${scope.sql}
     GROUP BY contact_id
   ) lm
     ON m.contact_id = lm.contact_id
@@ -138,7 +141,7 @@ export const getChatListService = async (tenant_id, limit = 200) => {
   LEFT JOIN (
     SELECT contact_id, COUNT(*) AS cnt
     FROM ${tableNames.MESSAGES}
-    WHERE tenant_id = ? AND seen = false AND sender = 'user' AND is_deleted = false
+    WHERE tenant_id = ? AND seen = false AND sender = 'user' AND is_deleted = false${scope.sql}
     GROUP BY contact_id
   ) uc ON uc.contact_id = m.contact_id
   WHERE m.tenant_id = ?
@@ -149,7 +152,15 @@ export const getChatListService = async (tenant_id, limit = 200) => {
 
   try {
     const [rows] = await db.sequelize.query(dataQuery, {
-      replacements: [tenant_id, tenant_id, tenant_id, tenant_id, limit],
+      replacements: [
+        tenant_id,
+        ...scope.params,
+        tenant_id,
+        tenant_id,
+        ...scope.params,
+        tenant_id,
+        limit,
+      ],
     });
 
     return rows;
@@ -185,15 +196,16 @@ export const getChatByPhoneService = async (phone, tenant_id) => {
     // ascending order. Ordering ASC + LIMIT would silently drop the newest
     // messages (e.g. a just-sent campaign/template message) once a conversation
     // exceeds 500 rows.
+    const scope = await getHistoryScope(tenant_id);
     const Query = `
     SELECT id, contact_id, sender, sender_id, message, message_type, interactive_payload, media_url, media_mime_type, media_filename, seen, status, wamid, created_at
     FROM ${tableNames?.MESSAGES}
-    WHERE ${whereClause} AND is_deleted = false
+    WHERE ${whereClause} AND is_deleted = false${scope.sql}
     ORDER BY created_at DESC
     LIMIT 500
   `;
     const [result] = await db.sequelize.query(Query, {
-      replacements: replacements,
+      replacements: [...replacements, ...scope.params],
     });
     return Array.isArray(result) ? result.reverse() : result;
   } catch (err) {
@@ -219,9 +231,10 @@ export const markSeenMessageService = async (tenant_id, phone) => {
       replacements = [suffix, tenant_id];
     }
 
-    const Query = `UPDATE ${tableNames?.MESSAGES} SET seen = true WHERE ${whereClause} AND tenant_id = ? AND seen = false AND sender = 'user'`;
+    const scope = await getHistoryScope(tenant_id);
+    const Query = `UPDATE ${tableNames?.MESSAGES} SET seen = true WHERE ${whereClause} AND tenant_id = ? AND seen = false AND sender = 'user'${scope.sql}`;
     const [result] = await db.sequelize.query(Query, {
-      replacements: replacements,
+      replacements: [...replacements, ...scope.params],
     });
     return result;
   } catch (err) {
@@ -267,15 +280,16 @@ export const suggestReplyService = async (tenant_id, phone) => {
       msgReplacements = [contact_id, tenant_id];
     }
 
+    const scope = await getHistoryScope(tenant_id);
     const [messages] = await db.sequelize.query(
       `
     SELECT sender, message, created_at
     FROM ${tableNames.MESSAGES}
-    WHERE ${msgWhere}
+    WHERE ${msgWhere}${scope.sql}
     ORDER BY created_at DESC
     LIMIT 30
     `,
-      { replacements: msgReplacements },
+      { replacements: [...msgReplacements, ...scope.params] },
     );
 
     // Reverse to get chronological order and format nicely
@@ -296,12 +310,12 @@ export const suggestReplyService = async (tenant_id, phone) => {
       `
     SELECT message
     FROM ${tableNames.MESSAGES}
-    WHERE ${msgWhere}
+    WHERE ${msgWhere}${scope.sql}
     AND sender = 'user'
     ORDER BY created_at DESC
     LIMIT 1
     `,
-      { replacements: msgReplacements },
+      { replacements: [...msgReplacements, ...scope.params] },
     );
 
     if (!lastMsg.length) {

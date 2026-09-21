@@ -109,6 +109,30 @@ export const WhatsappAccountTable = (sequelize, Sequelize) => {
         allowNull: true,
       },
 
+      // Onboarding metadata. NULL connection type is read as LEGACY_MANUAL by the
+      // application, so pre-existing rows never need to be rewritten.
+      whatsapp_connection_type: {
+        type: Sequelize.STRING(32),
+        allowNull: true,
+        comment: "LEGACY_MANUAL | EMBEDDED_STANDARD | EMBEDDED_COEXISTENCE (NULL = LEGACY_MANUAL)",
+      },
+
+      meta_business_id: {
+        type: Sequelize.STRING(64),
+        allowNull: true,
+      },
+
+      meta_embedded_config_id: {
+        type: Sequelize.STRING(64),
+        allowNull: true,
+      },
+
+      connected_at: {
+        type: Sequelize.DATE,
+        allowNull: true,
+        comment: "When an Embedded Signup connection was completed",
+      },
+
       createdAt: {
         type: Sequelize.DATE,
         allowNull: false,

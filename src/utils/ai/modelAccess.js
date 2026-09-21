@@ -48,14 +48,28 @@ export async function confirmModelAccess(client, tenantId, model, force = false)
   validateModelId(model);
   const key = `${tenantId || "platform"}:${credentialFingerprint(client)}:${model}`;
   if (!force && (access.get(key) || 0) > Date.now()) return;
+  let result;
   try {
-    const result = await client.models.retrieve(model, { timeout: 10000, maxRetries: 0 });
-    if (result.id !== model) throw new Error("Invalid model access response");
-    if (access.size >= 10000) access.clear();
-    access.set(key, Date.now() + TTL);
-  } catch {
+    // Admin-triggered checks (force: catalog test / activation) may wait longer than the
+    // request-path check, which must stay fast. A slow first connection to OpenAI is common
+    // on some networks and must not read as "access denied".
+    result = await client.models.retrieve(model, { timeout: force ? 25000 : 10000, maxRetries: 0 });
+  } catch (error) {
+    const status = Number(error?.status ?? error?.statusCode);
+    // Only an HTTP answer that says "no" means this credential cannot reach the model.
+    if (status === 401 || status === 403 || status === 404) {
+      throw new ModelConfigurationError("Model access could not be confirmed for this credential.", "AI_MODEL_ACCESS", 403);
+    }
+    // A timeout, network failure, rate limit or 5xx says NOTHING about access. Report it as
+    // unknown/retryable (503) so a transient blip neither blames the credential nor makes a
+    // working model look unavailable to tenants.
+    throw new ModelConfigurationError("OpenAI could not be reached to confirm model access. Try again shortly.", "AI_MODEL_ACCESS_UNKNOWN", 503);
+  }
+  if (result?.id !== model) {
     throw new ModelConfigurationError("Model access could not be confirmed for this credential.", "AI_MODEL_ACCESS", 403);
   }
+  if (access.size >= 10000) access.clear();
+  access.set(key, Date.now() + TTL);
 }
 
 export function sanitizedProviderError(error) {
@@ -83,6 +97,8 @@ export function sanitizeErrorForAdmin(error, failingCheck = null) {
   if (status === 429) return `${prefix}Rate limited by OpenAI — retry later.`;
   if (status === 401) return `${prefix}OpenAI authentication failed for this credential.`;
   if (status === 403 || code === "AI_MODEL_ACCESS") return `${prefix}This credential cannot access the model.`;
+  // Checked before the generic 5xx line: our own 503 here means "could not reach OpenAI", not an OpenAI server error.
+  if (code === "AI_MODEL_ACCESS_UNKNOWN") return `${prefix}Could not reach OpenAI to confirm model access (timeout/network) — retry later.`;
   if (status >= 500) return `${prefix}OpenAI returned a server error (${status}) — retry later.`;
   if (code === "AI_MODEL_MAPPING") return `${prefix}Returned model did not match the approved mapping.`;
   if (code === "AI_OUTPUT_INVALID") return `${prefix}Structured-output check returned invalid JSON.`;
@@ -91,5 +107,9 @@ export function sanitizeErrorForAdmin(error, failingCheck = null) {
   if (code === "AI_TARIFF_UNSUPPORTED") return `${prefix}Pricing/tariff configuration is incomplete for this model.`;
   if (code && code.startsWith("AI_")) return `${prefix}${redactSecrets(error.message).slice(0, 180)}`;
   if (/timeout|timed out|network|ECONN|ETIMEDOUT/i.test(String(error?.message))) return `${prefix}Network/timeout talking to OpenAI — retry later.`;
-  return `${prefix}Compatibility test failed${status ? ` (${status})` : ""}.`;
+  // Surface OpenAI's machine-readable error CODE (e.g. "image_parse_error") — never its free-text
+  // message, which could echo request content. Only a plain lowercase identifier is accepted.
+  const providerCode = typeof code === "string" && /^[a-z][a-z0-9_]{2,47}$/.test(code) ? code : null;
+  const detail = [status || null, providerCode].filter(Boolean).join(", ");
+  return `${prefix}Compatibility test failed${detail ? ` (${detail})` : ""}.`;
 }

@@ -14,6 +14,7 @@ import {
 import { missingFieldsChecker } from "../../utils/helpers/missingFields.js";
 import ServerEnvironmentConfig from "../../config/server.config.js";
 import { resolveMetaTier } from "../../utils/metaMessagingTier.js";
+import { resolveConnectionType } from "./whatsappConnectionTypes.js";
 
 const buildMessagingLimitResponse = (account, syncResult = null) => {
   const tier = resolveMetaTier(syncResult?.tier || account?.tier);
@@ -399,6 +400,10 @@ export const getWhatsappAccountController = async (req, res) => {
     // Never expose the raw token to the frontend
     const { access_token, ...safeAccount } = account;
     safeAccount.has_access_token = !!access_token;
+    // NULL (every pre-existing row) reads as LEGACY_MANUAL — nothing is rewritten.
+    safeAccount.whatsapp_connection_type = resolveConnectionType(
+      account.whatsapp_connection_type,
+    );
     safeAccount.quality = messagingLimit.quality;
     safeAccount.tier = messagingLimit.tier_key;
     safeAccount.messaging_limit = messagingLimit;

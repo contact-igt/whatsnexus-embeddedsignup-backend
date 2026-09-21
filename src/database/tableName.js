@@ -9,6 +9,8 @@ export const tableNames = {
   WHATSAPP_TEMPLATE_VARIABLES: "whatsapp_template_variables",
   WHATSAPP_TEMPLATE_SYNC_LOGS: "whatsapp_template_sync_logs",
   WHATSAPP_ACCOUNT: "whatsapp_accounts",
+  WHATSAPP_NUMBER_IDENTITIES: "whatsapp_number_identities",
+  WHATSAPP_ONBOARDING_SESSIONS: "whatsapp_onboarding_sessions",
   WHATSAPP_CAMPAIGN: "whatsapp_campaigns",
   WHATSAPP_CAMPAIGN_RECIPIENT: "whatsapp_campaign_recipients",
   CAMPAIGN_EVENTS: "campaign_events",

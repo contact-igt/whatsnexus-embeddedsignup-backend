@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto";
 import db from "../database/index.js";
+import { getHistoryScope } from "../models/WhatsappAccountModel/whatsappNumberScope.service.js";
 import { resolveMetaTier } from "../utils/metaMessagingTier.js";
 import { logger } from "../utils/logger.js";
 
@@ -15,12 +16,15 @@ export const hasOpenCustomerServiceWindow = async (tenantId, recipientPhone) => 
   // Phase 2: match the stored number using the SAME digits-only rule as
   // normalizeMetaRecipient() (`\D` → ""), instead of a partial 5-char REPLACE
   // chain that missed '.', '/', etc.
+  // Meta's customer-service window belongs to a business phone NUMBER: a customer
+  // message sent to another of this organization's numbers must not open it.
+  const scope = (await getHistoryScope(tenantId)).named();
   const rows = await db.sequelize.query(
     `SELECT 1
        FROM messages
       WHERE tenant_id = :tenantId
         AND sender = 'user'
-        AND created_at >= :windowStart
+        AND created_at >= :windowStart${scope.sql}
         AND REGEXP_REPLACE(
               CONCAT(COALESCE(country_code, ''), COALESCE(phone, '')),
               '[^0-9]', '') = :recipientPhone
@@ -30,6 +34,7 @@ export const hasOpenCustomerServiceWindow = async (tenantId, recipientPhone) => 
         tenantId,
         recipientPhone,
         windowStart: new Date(Date.now() - DAY_MS),
+        ...scope.replacements,
       },
       type: db.sequelize.QueryTypes.SELECT,
     },

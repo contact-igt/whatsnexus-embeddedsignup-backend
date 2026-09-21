@@ -36,6 +36,7 @@ export const AdminAuditLogTable = (sequelize, Sequelize) => {
           "gst_rate_change",
           "gst_rate_deactivate",
           "gst_rate_delete",
+          "whatsapp_capability_change",
         ),
         allowNull: false,
       },

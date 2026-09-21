@@ -1,5 +1,6 @@
 ﻿import db from "../../database/index.js";
 import { tableNames } from "../../database/tableName.js";
+import { getHistoryScope } from "../WhatsappAccountModel/whatsappNumberScope.service.js";
 import { buildChatHistory } from "../../utils/chat/buildChatHistory.js";
 import { calculateHeatState } from "../../utils/helpers/calculateHeatState.js";
 import cron from "node-cron";
@@ -419,6 +420,8 @@ const fetchMessageForIntentScoring = async (
     };
   }
 
+  // Scope to the active business number (empty / no-op unless the org switched numbers).
+  const scope = await getHistoryScope(tenant_id);
   let query = `
     SELECT id, message
     FROM ${tableNames.MESSAGES}
@@ -430,6 +433,8 @@ const fetchMessageForIntentScoring = async (
     query += " AND id = ?";
     replacements.push(message_id);
   }
+  query += scope.sql;
+  replacements.push(...scope.params);
 
   query += " ORDER BY created_at DESC LIMIT 1";
 
@@ -912,11 +917,12 @@ export const getLeadByLeadIdService = async (tenant_id, lead_id) => {
     const lead = normalizeLeadScoreFields(leads[0]);
 
     // Fetch last 4 messages for this lead (MySQL 5.7 compatible)
+    const scope = await getHistoryScope(tenant_id);
     const messagesQuery = `
       SELECT contact_id, sender, message, created_at FROM (
         SELECT contact_id, sender, message, created_at
         FROM ${tableNames.MESSAGES}
-        WHERE tenant_id = ? AND contact_id = ?
+        WHERE tenant_id = ? AND contact_id = ?${scope.sql}
         ORDER BY created_at DESC
         LIMIT 4
       ) as recent
@@ -924,7 +930,7 @@ export const getLeadByLeadIdService = async (tenant_id, lead_id) => {
     `;
 
     const [messages] = await db.sequelize.query(messagesQuery, {
-      replacements: [tenant_id, lead.contact_id],
+      replacements: [tenant_id, lead.contact_id, ...scope.params],
     });
 
     return {
@@ -1183,22 +1189,32 @@ export const getLeadListService = async (tenant_id) => {
 
     // 2. Fetch last 4 messages for these leads for preview
     const contactIds = normalizedLeads.map((l) => l.contact_id);
+    const scope = await getHistoryScope(tenant_id);
+    const innerScope = scope.forColumn("phone_number_id");
+    const outerScope = scope.forColumn("m.phone_number_id");
     const messagesQuery = `
       SELECT m.contact_id, m.sender, m.message, m.created_at
       FROM ${tableNames.MESSAGES} m
       INNER JOIN (
         SELECT contact_id, MAX(created_at) as max_created
         FROM ${tableNames.MESSAGES}
-        WHERE tenant_id = ? AND contact_id IN (?)
+        WHERE tenant_id = ? AND contact_id IN (?)${innerScope.sql}
         GROUP BY contact_id
       ) latest ON m.contact_id = latest.contact_id
-      WHERE m.tenant_id = ? AND m.contact_id IN (?)
+      WHERE m.tenant_id = ? AND m.contact_id IN (?)${outerScope.sql}
         AND m.created_at >= DATE_SUB(latest.max_created, INTERVAL 7 DAY)
       ORDER BY m.contact_id, m.created_at DESC
     `;
 
     const [allMessages] = await db.sequelize.query(messagesQuery, {
-      replacements: [tenant_id, contactIds, tenant_id, contactIds],
+      replacements: [
+        tenant_id,
+        contactIds,
+        ...innerScope.params,
+        tenant_id,
+        contactIds,
+        ...outerScope.params,
+      ],
     });
 
     // 3. Group messages by contact_id, keep last 4, and reverse to chronological
@@ -1245,6 +1261,10 @@ const getMessagesForSummary = async (
     whereClause += " AND created_at <= ?";
     replacements.push(`${dateTo} 23:59:59`);
   }
+
+  const scope = await getHistoryScope(tenant_id);
+  whereClause += scope.sql;
+  replacements.push(...scope.params);
 
   const limitClause = dateFrom ? "LIMIT 200" : "LIMIT 50";
 

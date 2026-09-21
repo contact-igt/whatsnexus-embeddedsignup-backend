@@ -1,5 +1,6 @@
 import db from "../../database/index.js";
 import { tableNames } from "../../database/tableName.js";
+import { getHistoryScope } from "../WhatsappAccountModel/whatsappNumberScope.service.js";
 
 export const getConversationMemory = async (tenant_id, phone, contact_id = null) => {
   if (!phone && !contact_id) return [];
@@ -18,16 +19,18 @@ export const getConversationMemory = async (tenant_id, phone, contact_id = null)
     replacements.push(suffix);
   }
 
+  // AI context must not mix in another business number's conversation either.
+  const scope = await getHistoryScope(tenant_id);
   const [rows] = await db.sequelize.query(
     `
     SELECT sender, message, message_type, media_filename, interactive_payload, created_at
     FROM ${tableNames.MESSAGES}
-    WHERE ${whereClause}
+    WHERE ${whereClause}${scope.sql}
     ORDER BY created_at DESC
     LIMIT 50
     `,
     {
-      replacements: replacements,
+      replacements: [...replacements, ...scope.params],
     },
   );
 
