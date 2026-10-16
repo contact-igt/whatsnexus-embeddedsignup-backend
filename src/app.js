@@ -4,6 +4,8 @@ import fileUpload from "express-fileupload";
 import http from "http";
 import dns from "dns";
 import db from "./database/index.js";
+import ServerEnvironmentConfig from "./config/server.config.js";
+import { resolveStartupMigrationMode } from "./config/startupMigrationMode.js";
 import { initSocket } from "./middlewares/socket/socket.js";
 import AuthWhatsappRouter from "./models/AuthWhatsapp/AuthWhatsapp.routes.js";
 import WhatsappMessageRouter from "./models/Messages/messages.routes.js";
@@ -19,65 +21,123 @@ import TenantInvitationRouter from "./models/TenantInvitationModel/tenantinvitat
 import TenantUserRouter from "./models/TenantUserModel/tenantuser.routes.js";
 import WhatsappTemplateRouter from "./models/WhatsappTemplateModel/whatsapptemplate.routes.js";
 import WhatsappCampaignRouter from "./models/WhatsappCampaignModel/whatsappcampaign.routes.js";
+import GalleryRouter from "./models/GalleryModel/gallery.routes.js";
+import AttachmentRouter from "./models/AttachmentModel/attachment.routes.js";
 import ContactGroupRouter from "./models/ContactGroupModel/contactGroup.routes.js";
+import AppointmentRouter from "./models/AppointmentModel/appointment.routes.js";
 import { startCampaignSchedulerService } from "./models/WhatsappCampaignModel/whatsappcampaign.service.js";
 import { startLeadHeatDecayCronService } from "./models/LeadsModel/leads.service.js";
 import { startLiveChatCleanupService } from "./models/LiveChatModel/livechat.service.js";
 import DoctorRouter from "./models/DoctorModel/doctor.routes.js";
 import SpecializationRouter from "./models/SpecializationModel/specialization.routes.js";
-import AppointmentRouter from "./models/AppointmentModel/appointment.routes.js";
+import BranchRouter from "./models/BranchModel/branch.routes.js";
 import DashboardRouter from "./models/DashboardModel/dashboard.routes.js";
-import { startAppointmentSchedulerService } from "./models/AppointmentModel/appointment.service.js";
 import PlaygroundRouter from "./models/Playground/playground.routes.js";
 import BillingRouter from "./models/BillingModel/billing.routes.js";
 import WhatsappOtpRouter from "./models/OtpVerificationModel/otpverification.routes.js";
 import PaymentRouter from "./models/PaymentModel/payment.routes.js";
 import SuperAdminDashboardRouter from "./models/SuperAdminDashboardModel/superAdminDashboard.routes.js";
+import ApiRequestLogRouter from "./models/ApiRequestLogModel/apiRequestLog.routes.js";
+import {
+  runBillingCycleCron,
+  runAutoRechargeCron,
+  runInvoiceRetryCron,
+} from "./models/BillingModel/billingCycle.service.js";
 import FaqRouter from "./models/Faq/faq.routes.js";
-import { runBillingCycleCron } from "./models/BillingModel/billingCycle.service.js";
+import CoursesRouter from "./models/CoursesModel/courses.routes.js";
+import MentorsRouter from "./models/MentorsModel/mentors.routes.js";
+import TenantFeatureAccessTenantRouter from "./models/TenantFeatureAccessModel/tenantFeatureAccess.tenant.routes.js";
+import TenantFeatureAccessManagementRouter from "./models/TenantFeatureAccessModel/tenantFeatureAccess.management.routes.js";
+import WhatsappCapabilitiesManagementRouter from "./models/WhatsappAccountModel/whatsappCapabilities.management.routes.js";
+import ModuleAccessTenantRouter from "./models/ModuleAccessModel/moduleAccess.tenant.routes.js";
+import ModuleAccessManagementRouter from "./models/ModuleAccessModel/moduleAccess.management.routes.js";
 import { checkHealthAlerts } from "./utils/billing/billingHealthMonitor.js";
 import { runDailyReconciliation } from "./utils/billing/paymentReconciler.js";
 import { initBillingQueue } from "./utils/billing/billingQueue.js";
+import {
+  initCampaignQueues,
+  ensureCampaignQueues,
+} from "./queues/campaignQueue.js";
+import {
+  startCampaignDispatchWorker,
+  getDispatchWorkerStatus,
+  closeDispatchWorker,
+} from "./workers/campaignDispatchWorker.js";
+import {
+  startCampaignSendWorker,
+  getSendWorkerStatus,
+  closeSendWorker,
+} from "./workers/campaignSendWorker.js";
+import { validateRazorpayConfig } from "./models/PaymentModel/payment.service.js";
+import { logger } from "./utils/logger.js";
+import { authenticate, authorize } from "./middlewares/auth/authMiddlewares.js";
+import { getCampaignDiagnosticsController } from "./models/WhatsappCampaignModel/whatsappcampaign.controller.js";
+import { apiRequestLogger } from "./middlewares/apiRequestLogger/index.js";
 import cron from "node-cron";
+import { tableNames } from "./database/tableName.js";
+import { runHardDeleteCron } from "./utils/lifecycle/hardDeleteCron.js";
+import { runMissingMessageBillingReconciliationCron } from "./cron/reconciliationCron.js";
+import { runMetaTierReconciliationCron } from "./cron/metaTierReconciliationCron.js";
+import { retryUnmatchedStatusEvents } from "./services/metaMessagingLimit.service.js";
+import { runScheduledMessageCron } from "./cron/scheduledMessageCron.js";
+import { runAiModelCatalogSyncCron } from "./cron/aiModelCatalogSyncCron.js";
+import { recoverPendingHandoffEvents } from "./services/aiHandoffOutbox.service.js";
+import { initBillingReconciliationCron } from "./cron/billingReconciliationCron.js"; // B-2: Orphaned reservation reconciliation
+import { cleanupExpiredSessions } from "./models/AppointmentModel/appointmentConversation.service.js";
+import { expireAdvancedAppointmentSessions } from "./models/AppointmentModel/Advanced_Appointment_Booking.service.js";
+import { expireManageAppointmentSessions } from "./models/AppointmentModel/Manage_Booked_Appointments.service.js";
 
 dns.setDefaultResultOrder("ipv4first");
 
 const app = express();
 
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "x-meta-token",
-      "ngrok-skip-browser-warning",
-    ],
-    credentials: false,
-  }),
-);
+const corsOptions = {
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "x-meta-token",
+    "ngrok-skip-browser-warning",
+  ],
+  credentials: false,
+};
 
-// Handle preflight requests explicitly
-app.options("*", cors());
+// Explicit preflight handler — must come before app.use(cors()) so OPTIONS
+// requests are short-circuited at the highest priority, before any router
+// or auth middleware can intercept them.
+app.use(cors(corsOptions));
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "10mb" })); // 25 MB — covers document uploads (largest allowed type)
+app.use(express.urlencoded({ extended: true, limit: "10mb" })); // 25 MB — covers document uploads (largest allowed type)
 
 app.use(
   fileUpload({
-    limits: { fileSize: 20 * 1024 * 1024 },
+    limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB — covers document uploads (largest allowed type)
     abortOnLimit: true,
   }),
 );
 
 app.use((req, res, next) => {
-  console.log("➡️ Incoming:", req.method, req.url);
+  logger.debug("Incoming:", req.method, req.url);
   next();
 });
 
-app.use("/api/management", SuperAdminDashboardRouter, ManagementRouter);
+app.use(apiRequestLogger);
+app.options("*", cors(corsOptions));
 
+app.use("/api/management", ModuleAccessManagementRouter);
+app.use(
+  "/api/management",
+  SuperAdminDashboardRouter,
+  ApiRequestLogRouter,
+  ManagementRouter,
+);
+app.use("/api/management", TenantFeatureAccessManagementRouter);
+app.use("/api/management", WhatsappCapabilitiesManagementRouter);
+
+app.use("/api/tenant", TenantFeatureAccessTenantRouter);
+app.use("/api/tenant", ModuleAccessTenantRouter);
 app.use("/api/tenant", TenantRouter, TenantUserRouter, TenantInvitationRouter);
 
 app.use(
@@ -90,48 +150,292 @@ app.use(
   ContactRouter,
   LeadRouter,
   LiveChatRouter,
+  AppointmentRouter,
   WhatsappTemplateRouter,
   WhatsappCampaignRouter,
+  GalleryRouter,
   ContactGroupRouter,
+  BranchRouter,
   DoctorRouter,
   SpecializationRouter,
-  AppointmentRouter,
   PlaygroundRouter,
   DashboardRouter,
   BillingRouter,
   WhatsappOtpRouter,
   PaymentRouter,
   FaqRouter,
+  AttachmentRouter,
+  MentorsRouter,
+  CoursesRouter,
 );
 
 app.get("/", (req, res) => {
   res.json({ status: "OK" });
 });
 
-await db.sequelize.sync({ alter: true });
-console.log("DB connected");
+app.get(
+  "/api/campaign/diagnostics",
+  authenticate,
+  authorize({
+    user_type: "tenant",
+    // [DOCTOR ROLE UNWIRED – 2026-05-13] doctor access removed from diagnostics.
+    roles: ["tenant_admin", "staff"],
+  }),
+  getCampaignDiagnosticsController,
+);
+
+// Global error handler — must be registered AFTER all routes.
+// Ensures CORS headers are present on every error response so the browser
+// doesn't misreport a 4xx/5xx as a CORS failure.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET,POST,PUT,DELETE,PATCH,OPTIONS",
+  );
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type,Authorization,x-meta-token,ngrok-skip-browser-warning",
+  );
+
+  const status = err?.status || err?.statusCode || 500;
+  res.locals.errorMessage = err?.message || null;
+  logger.error(
+    `[ERROR-HANDLER] ${req.method} ${req.url} → ${status}:`,
+    err?.message,
+  );
+  res.status(status).json({
+    success: false,
+    message: err?.message || "Internal server error",
+  });
+});
+
+{
+  const MAX_RETRIES = 5;
+  const RETRY_DELAY_MS = 3000;
+  const { isProduction, autoMigrate, reason } = resolveStartupMigrationMode({
+    serverLine: ServerEnvironmentConfig?.server?.line,
+    DB_AUTO_MIGRATE: process.env.DB_AUTO_MIGRATE,
+    ALLOW_PRODUCTION_SCHEMA_ALTER: process.env.ALLOW_PRODUCTION_SCHEMA_ALTER,
+  });
+  logger.info(`[DB] startup migration mode: ${reason}`);
+  if (isProduction && autoMigrate) {
+    logger.warn(
+      "[DB] ⚠  ALLOW_PRODUCTION_SCHEMA_ALTER=true — sequelize.sync({ alter: true }) will run against PRODUCTION. This should only ever be a deliberate, supervised action.",
+    );
+  }
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      if (autoMigrate) {
+        await db.sequelize.sync({ alter: true });
+      } else {
+        await db.sequelize.authenticate();
+        const { assertCatalogSchema } = await import("./utils/ai/catalogSchemaPreflight.js");
+        await assertCatalogSchema(db, { fatal: true });
+        const { assertWhatsappEmbeddedSchema } = await import("./utils/whatsappEmbeddedSchemaPreflight.js");
+        await assertWhatsappEmbeddedSchema(db, { fatal: true });
+      }
+
+      const [, cleanupMeta] = await db.sequelize.query(
+        `UPDATE ${tableNames.TENANT_USERS}
+         SET role = 'staff'
+         WHERE role NOT IN ('tenant_admin', 'staff')`,
+      );
+      const cleanupCount = cleanupMeta?.affectedRows ?? 0;
+      if (cleanupCount > 0) {
+        logger.warn(
+          `[DB] Normalized ${cleanupCount} invalid tenant-user role row(s) after sync`,
+        );
+      }
+
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      logger.warn(
+        `[DB] Connection attempt ${attempt}/${MAX_RETRIES} failed: ${err.message}`,
+      );
+      if (attempt < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+      }
+    }
+  }
+  if (lastErr) throw lastErr;
+}
+
+logger.info("DB connected");
+
+// Validate Razorpay configuration at startup (fail-fast if misconfigured)
+try {
+  validateRazorpayConfig();
+  logger.info("[PAYMENT] Razorpay configuration validated successfully");
+} catch (err) {
+  logger.warn(
+    `[PAYMENT] ${err.message} — payment features will be unavailable until fixed`,
+  );
+}
 
 startLeadHeatDecayCronService();
 startLiveChatCleanupService();
-startCampaignSchedulerService();
-startAppointmentSchedulerService();
+
+// B-2: Initialize billing orphan reconciliation cron (every 15 minutes)
+initBillingReconciliationCron();
+
+// Initialize campaign queues before starting the scheduler so the cron can
+// enqueue BullMQ jobs on its very first tick.
+initCampaignQueues()
+  .then(async () => {
+    startCampaignDispatchWorker();
+    await startCampaignSendWorker();
+    logger.info(
+      `[STARTUP] Dispatch worker status: ${JSON.stringify(getDispatchWorkerStatus())}`,
+    );
+    logger.info(
+      `[STARTUP] Send worker status: ${JSON.stringify(getSendWorkerStatus())}`,
+    );
+    startCampaignSchedulerService();
+  })
+  .catch((err) => {
+    logger.error(
+      `[STARTUP] Campaign queue init failed: ${err.message} — starting scheduler in fallback mode`,
+    );
+    startCampaignSchedulerService();
+  });
+
+// Supervisor: if Redis drops and does not self-heal (or was never reachable at
+// boot), keep trying to bring the campaign queue + dispatch worker back so
+// campaigns don't sit PENDING until a manual redeploy.
+const campaignQueueSupervisor = setInterval(() => {
+  void ensureCampaignQueues()
+    .then((available) => {
+      if (available && !getDispatchWorkerStatus().running) {
+        startCampaignDispatchWorker();
+        void startCampaignSendWorker();
+        logger.warn(
+          "[CAMPAIGN-SUPERVISOR] Queue recovered - dispatch/send workers restarted",
+        );
+      }
+    })
+    .catch(() => {});
+}, 30000);
+if (typeof campaignQueueSupervisor.unref === "function") {
+  campaignQueueSupervisor.unref();
+}
 
 // Billing system crons
 cron.schedule("5 0 * * *", () => {
-  console.log("[CRON] Running billing cycle cron...");
+  logger.debug("[CRON] Running billing cycle cron...");
   runBillingCycleCron();
 }); // Daily at 00:05 UTC
+
+cron.schedule("*/5 * * * *", () => {
+  runAutoRechargeCron();
+}); // Every 5 minutes — check low-balance wallets with auto-recharge enabled
+
+cron.schedule("0 * * * *", () => {
+  runInvoiceRetryCron();
+}); // Every hour — retry overdue invoice payment reminders
+
+cron.schedule("*/15 * * * *", () => {
+  cleanupExpiredSessions();
+}); // Every 15 min: mark booking_sessions where expires_at < NOW() as 'expired'
+
+cron.schedule("* * * * *", () => {
+  expireAdvancedAppointmentSessions().catch((err) => {
+    logger.error(`[CRON] Advanced appointment expiry failed: ${err.message}`);
+  });
+}); // Every minute — expire advanced appointment sessions and release slot locks
+
+cron.schedule("* * * * *", () => {
+  expireManageAppointmentSessions().catch((err) => {
+    logger.error(`[CRON] Manage appointment expiry failed: ${err.message}`);
+  });
+}); // Every minute — expire manage appointment sessions
 
 cron.schedule("*/15 * * * *", () => {
   checkHealthAlerts();
 }); // Every 15 minutes
 
 cron.schedule("0 2 * * *", () => {
-  console.log("[CRON] Running daily reconciliation...");
+  logger.debug("[CRON] Running daily reconciliation...");
   runDailyReconciliation();
 }); // Daily at 02:00 UTC
 
-// Initialize billing queue (optional — requires Redis)
+cron.schedule("*/10 * * * *", () => {
+  logger.debug("[CRON] Running missing-message billing reconciliation...");
+  void runMissingMessageBillingReconciliationCron().catch((error) => {
+    logger.error(
+      `[CRON] Unhandled missing-message reconciliation failure: ${error.message}`,
+    );
+  });
+}); // Every 10 minutes — detect outbound messages missing billing artifacts
+
+cron.schedule(
+  "* * * * *",
+  () => {
+    void runScheduledMessageCron().catch((err) => {
+      logger.error(`[CRON] Scheduled message send failed: ${err.message}`);
+    });
+  },
+  { timezone: "Asia/Kolkata" },
+); // Every 1 min — send pending WhatsApp follow-up / no-show messages
+
+// Repeated-message AI handoff: durable notice recovery (every 1 min + at boot).
+// No-op unless there are pending/failed handoff events.
+cron.schedule("* * * * *", () => {
+  void recoverPendingHandoffEvents().catch((err) => {
+    logger.error(`[CRON] Handoff notice recovery failed: ${err.message}`);
+  });
+});
+setTimeout(() => {
+  void recoverPendingHandoffEvents().catch(() => {});
+}, 15000);
+
+// FIX 11 — Meta tier/quality reconciliation backstop (every 6 hours)
+cron.schedule("30 */6 * * *", () => {
+  void runMetaTierReconciliationCron().catch((err) => {
+    logger.error(`[CRON] Meta tier reconciliation failed: ${err.message}`);
+  });
+});
+
+// R-3 — retry delivery/read/failed webhooks that raced ahead of ledger correlation
+cron.schedule("* * * * *", () => {
+  void retryUnmatchedStatusEvents().catch((err) => {
+    logger.error(`[CRON] Unmatched status-event retry failed: ${err.message}`);
+  });
+});
+
+// Master lifecycle hard-delete cron — runs at 04:00 UTC daily
+// Processes ALL Tier 1 tables (campaigns, templates, knowledge, contacts, doctors, etc.)
+cron.schedule("0 4 * * *", async () => {
+  await runHardDeleteCron();
+}); // Daily at 04:00 UTC
+
+// AI model catalog: discover new OpenAI models once daily. Additive only —
+// new models land as pending/hidden; never activated or priced automatically.
+cron.schedule("40 1 * * *", () => {
+  void runAiModelCatalogSyncCron();
+}); // Daily at 01:40 UTC
+
+// FAQ: purge hard-deleted knowledge chunks older than 30 days
+cron.schedule("0 3 * * *", async () => {
+  try {
+    const [, meta] = await db.sequelize.query(
+      `DELETE FROM ${tableNames.KNOWLEDGECHUNKS}
+       WHERE is_deleted = true
+         AND deleted_at < DATE_SUB(NOW(), INTERVAL 30 DAY)`,
+    );
+    const removed = meta?.affectedRows ?? 0;
+    if (removed > 0) {
+      logger.info(`[CRON] Purged ${removed} soft-deleted knowledge chunk(s)`);
+    }
+  } catch (err) {
+    logger.error("[CRON] knowledge-chunk cleanup error:", err.message);
+  }
+}); // Daily at 03:00 UTC
+
 initBillingQueue();
 
 const PORT = process.env.PORT || 8000;
@@ -140,5 +444,31 @@ const server = http.createServer(app);
 initSocket(server);
 
 server.listen(PORT, () => {
-  console.log("✅ Server + Socket running on", PORT);
+  logger.info("Server + Socket running on", PORT);
 });
+
+/**
+ * Graceful shutdown: flush all campaign send worker buffers and close workers
+ * before process exits. Prevents data loss on SIGTERM/SIGINT/crash.
+ * B-5 mitigation: ensures up to ~100 buffered messages are persisted before exit.
+ */
+const gracefulShutdown = async () => {
+  logger.info("[SHUTDOWN] Graceful shutdown initiated...");
+  try {
+    logger.info("[SHUTDOWN] Closing send worker (will flush buffers)...");
+    await closeSendWorker();
+  } catch (err) {
+    logger.error(`[SHUTDOWN] Error closing send worker: ${err.message}`);
+  }
+  try {
+    logger.info("[SHUTDOWN] Closing dispatch worker...");
+    await closeDispatchWorker();
+  } catch (err) {
+    logger.error(`[SHUTDOWN] Error closing dispatch worker: ${err.message}`);
+  }
+  logger.info("[SHUTDOWN] Graceful shutdown complete. Exiting.");
+  process.exit(0);
+};
+
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);

@@ -1,5 +1,6 @@
 import { tableNames } from "../../database/tableName.js";
 import db from "../../database/index.js";
+import { getHistoryScope } from "../WhatsappAccountModel/whatsappNumberScope.service.js";
 import cron from "node-cron";
 
 export const createLiveChatService = async (
@@ -50,7 +51,7 @@ export const updateLiveChatTimestampService = async (tenant_id, contact_id) => {
 
 export const startLiveChatCleanupService = () => {
   cron.schedule("*/1 * * * *", async () => {
-    console.log("livechat cleaup started");
+    
 
     const Query = `
     DELETE FROM ${tableNames?.LIVECHAT} 
@@ -66,6 +67,8 @@ export const startLiveChatCleanupService = () => {
 };
 
 export const getLiveChatListService = async (tenant_id, limit = 200) => {
+  // Empty (query unchanged) unless the org switched to a different business number.
+  const scope = await getHistoryScope(tenant_id);
   const dataQuery = `
     SELECT
       m.contact_id,
@@ -77,20 +80,25 @@ export const getLiveChatListService = async (tenant_id, limit = 200) => {
       lc.assigned_admin_id,
       agent.username AS assigned_agent_name,
       c.is_ai_silenced,
+      c.ai_pause_reason,
+      c.ai_paused_at,
+      c.ai_reply_epoch,
       COALESCE(uc.cnt, 0) AS unread_count
     FROM messages m
     INNER JOIN (
       SELECT
         contact_id,
-        MAX(created_at) AS last_message_time
+        MAX(created_at) AS last_message_time,
+        MAX(id) AS last_message_id
       FROM messages
-      WHERE tenant_id = ? AND is_deleted = false
+      WHERE tenant_id = ? AND is_deleted = false${scope.sql}
       GROUP BY contact_id
     ) lm
       ON m.contact_id = lm.contact_id
-     AND m.created_at = lm.last_message_time
+     AND m.id = lm.last_message_id
     JOIN contacts c
       ON c.contact_id = m.contact_id
+     AND c.tenant_id = m.tenant_id
     INNER JOIN ${tableNames.LIVECHAT} lc
       ON lc.contact_id = m.contact_id
      AND lc.tenant_id = ?
@@ -100,7 +108,7 @@ export const getLiveChatListService = async (tenant_id, limit = 200) => {
     LEFT JOIN (
       SELECT contact_id, COUNT(*) AS cnt
       FROM ${tableNames.MESSAGES}
-      WHERE tenant_id = ? AND seen = false AND sender = 'user' AND is_deleted = false
+      WHERE tenant_id = ? AND seen = false AND sender = 'user' AND is_deleted = false${scope.sql}
       GROUP BY contact_id
     ) uc ON uc.contact_id = m.contact_id
     WHERE m.tenant_id = ?
@@ -110,7 +118,15 @@ export const getLiveChatListService = async (tenant_id, limit = 200) => {
 
   try {
     const [rows] = await db.sequelize.query(dataQuery, {
-      replacements: [tenant_id, tenant_id, tenant_id, tenant_id, limit],
+      replacements: [
+        tenant_id,
+        ...scope.params,
+        tenant_id,
+        tenant_id,
+        ...scope.params,
+        tenant_id,
+        limit,
+      ],
     });
 
     return rows;
@@ -120,12 +136,16 @@ export const getLiveChatListService = async (tenant_id, limit = 200) => {
 };
 
 export const getHistoryChatListService = async (tenant_id, limit = 200) => {
+  const scope = await getHistoryScope(tenant_id);
   const dataQuery = `
     SELECT
       c.contact_id,
       c.phone,
       c.name,
       c.is_ai_silenced,
+      c.ai_pause_reason,
+      c.ai_paused_at,
+      c.ai_reply_epoch,
       m.message,
       m.message_type,
       m.created_at AS last_message_time,
@@ -134,22 +154,24 @@ export const getHistoryChatListService = async (tenant_id, limit = 200) => {
     INNER JOIN (
       SELECT
         contact_id,
-        MAX(created_at) AS last_message_time
+        MAX(created_at) AS last_message_time,
+        MAX(id) AS last_message_id
       FROM messages
-      WHERE tenant_id = ? AND is_deleted = false
+      WHERE tenant_id = ? AND is_deleted = false${scope.sql}
       GROUP BY contact_id
     ) lm
       ON m.contact_id = lm.contact_id
-     AND m.created_at = lm.last_message_time
+     AND m.id = lm.last_message_id
     JOIN contacts c
       ON c.contact_id = m.contact_id
+     AND c.tenant_id = m.tenant_id
     LEFT JOIN ${tableNames.LIVECHAT} lc
       ON lc.contact_id = c.contact_id
      AND lc.tenant_id = ?
     LEFT JOIN (
       SELECT contact_id, COUNT(*) AS cnt
       FROM ${tableNames.MESSAGES}
-      WHERE tenant_id = ? AND seen = false AND sender = 'user' AND is_deleted = false
+      WHERE tenant_id = ? AND seen = false AND sender = 'user' AND is_deleted = false${scope.sql}
       GROUP BY contact_id
     ) uc ON uc.contact_id = c.contact_id
     WHERE m.tenant_id = ?
@@ -160,7 +182,15 @@ export const getHistoryChatListService = async (tenant_id, limit = 200) => {
 
   try {
     const [rows] = await db.sequelize.query(dataQuery, {
-      replacements: [tenant_id, tenant_id, tenant_id, tenant_id, limit],
+      replacements: [
+        tenant_id,
+        ...scope.params,
+        tenant_id,
+        tenant_id,
+        ...scope.params,
+        tenant_id,
+        limit,
+      ],
     });
 
     return {

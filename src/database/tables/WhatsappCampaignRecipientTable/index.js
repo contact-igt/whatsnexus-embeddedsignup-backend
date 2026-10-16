@@ -34,6 +34,7 @@ export const WhatsappCampaignRecipientTable = (sequelize, Sequelize) => {
           "read",
           "replied",
           "failed",
+          "permanently_failed",
         ),
         defaultValue: "pending",
         allowNull: false,
@@ -43,6 +44,13 @@ export const WhatsappCampaignRecipientTable = (sequelize, Sequelize) => {
         type: Sequelize.STRING,
         allowNull: true,
       },
+
+      billing_hold_id: { type: Sequelize.STRING(96), allowNull: true },
+      authorized_billing_mode: {
+        type: Sequelize.ENUM("prepaid", "postpaid"),
+        allowNull: true,
+      },
+      authorized_cost_inr: { type: Sequelize.DECIMAL(15, 6), allowNull: true },
 
       error_message: {
         type: Sequelize.TEXT,
@@ -56,8 +64,35 @@ export const WhatsappCampaignRecipientTable = (sequelize, Sequelize) => {
           "Array of variable values for template placeholders, e.g., ['John', '10:00 AM']",
       },
 
+      retry_count: {
+        type: Sequelize.INTEGER,
+        allowNull: false,
+        defaultValue: 0,
+      },
+
+      next_retry_at: {
+        type: Sequelize.DATE,
+        allowNull: true,
+      },
+
+      last_error: {
+        type: Sequelize.TEXT,
+        allowNull: true,
+      },
+
+      opened_at: {
+        type: Sequelize.DATE,
+        allowNull: true,
+      },
+
+      clicked_at: {
+        type: Sequelize.DATE,
+        allowNull: true,
+      },
+
       is_deleted: {
         type: Sequelize.BOOLEAN,
+        allowNull: false,
         defaultValue: false,
       },
 
@@ -94,8 +129,16 @@ export const WhatsappCampaignRecipientTable = (sequelize, Sequelize) => {
           fields: ["status"],
         },
         {
+          name: "idx_recipient_retry",
+          fields: ["status", "retry_count", "next_retry_at"],
+        },
+        {
           name: "idx_recipient_meta_id",
           fields: ["meta_message_id"],
+        },
+        {
+          name: "idx_recipient_billing_hold",
+          fields: ["billing_hold_id"],
         },
         {
           name: "idx_recipient_mobile",

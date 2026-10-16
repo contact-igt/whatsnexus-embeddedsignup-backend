@@ -1,9 +1,12 @@
+import catalogRouter from "../AiModelCatalogModel/catalog.routes.js";
 import express from "express";
 import {
   deleteManagmentByIdController,
   getManagementByIdController,
   getManagementController,
   getLoggedManagementController,
+  getLoggedManagementPreferencesController,
+  updateLoggedManagementPreferencesController,
   loginManagementController,
   registerManagementController,
   softDeleteManagementController,
@@ -33,6 +36,7 @@ import {
 } from "../../middlewares/auth/authMiddlewares.js";
 
 const Router = express.Router();
+Router.use("/ai-model-catalog", catalogRouter);
 
 Router.post(
   "/register",
@@ -51,6 +55,26 @@ Router.get(
     roles: ["platform_admin", "super_admin"],
   }),
   getLoggedManagementController,
+);
+
+Router.get(
+  "/preferences",
+  authenticate,
+  authorize({
+    user_type: "management",
+    roles: ["platform_admin", "super_admin"],
+  }),
+  getLoggedManagementPreferencesController,
+);
+
+Router.put(
+  "/preferences",
+  authenticate,
+  authorize({
+    user_type: "management",
+    roles: ["platform_admin", "super_admin"],
+  }),
+  updateLoggedManagementPreferencesController,
 );
 
 Router.get(

@@ -8,22 +8,23 @@ import {
   createWhatsappTemplateController,
   getTemplateByIdController,
   getTemplateListController,
-  permanentDeleteTemplateController,
-  softDeleteTemplateController,
   submitWhatsappTemplateController,
   syncAllWhatsappTemplatesController,
   syncWhatsappTemplateStatusController,
   updateWhatsappTemplateController,
   resubmitWhatsappTemplateController,
   generateAiTemplateController,
-  getDeletedTemplateListController,
-  restoreTemplateController,
-  uploadWhatsappTemplateMediaController,
+  uploadTemplateMediaController,
 } from "./whatsapptemplate.controller.js";
+import {
+  softDeleteTemplateController,
+  hardDeleteTemplateController,
+  restoreTemplateController,
+  getDeletedTemplatesController,
+} from "./whatsapptemplate.lifecycle.js";
 
 const router = express.Router();
-
-const tenantRoles = ["tenant_admin", "doctor", "staff", "agent"];
+const tenantRoles = ["tenant_admin", "staff"];
 
 router.post(
   "/whatsapp-template",
@@ -36,7 +37,7 @@ router.get(
   "/whatsapp-templates/deleted/list",
   authenticate,
   authorize({ user_type: "tenant", roles: tenantRoles }),
-  getDeletedTemplateListController,
+  getDeletedTemplatesController,
 );
 
 router.post(
@@ -109,7 +110,7 @@ router.post(
   "/whatsapp-template/upload-media",
   authenticate,
   authorize({ user_type: "tenant", roles: tenantRoles }),
-  uploadWhatsappTemplateMediaController,
+  uploadTemplateMediaController,
 );
 
 router.delete(
@@ -123,7 +124,7 @@ router.delete(
   "/whatsapp-template/:template_id/permanent",
   authenticate,
   authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
-  permanentDeleteTemplateController,
+  hardDeleteTemplateController,
 );
 
 router.post(
@@ -131,6 +132,38 @@ router.post(
   authenticate,
   authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
   restoreTemplateController,
+);
+
+// REST aliases (v1 contract friendly)
+router.post(
+  "/templates",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  createWhatsappTemplateController,
+);
+router.get(
+  "/templates",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  getTemplateListController,
+);
+router.get(
+  "/templates/:template_id",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  getTemplateByIdController,
+);
+router.put(
+  "/templates/:template_id",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  updateWhatsappTemplateController,
+);
+router.delete(
+  "/templates/:template_id",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  softDeleteTemplateController,
 );
 
 export default router;

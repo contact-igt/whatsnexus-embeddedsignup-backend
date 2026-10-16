@@ -1,24 +1,25 @@
 import express from "express";
 import {
   createContactController,
-  deleteContactController,
-  permanentDeleteContactController,
   getAllContactsController,
   getContactByIdController,
   updateContactController,
-  getDeletedContactListController,
-  restoreContactController,
   importContactsController,
   toggleSilenceAiController,
 } from "./contacts.controller.js";
+import {
+  softDeleteContactController,
+  hardDeleteContactController,
+  restoreContactController,
+  getDeletedContactsController,
+} from "./contacts.lifecycle.js";
 import {
   authenticate,
   authorize,
 } from "../../middlewares/auth/authMiddlewares.js";
 
 const Router = express.Router();
-
-const tenantRoles = ["tenant_admin", "doctor", "staff", "agent"];
+const tenantRoles = ["tenant_admin", "staff"];
 
 Router.post(
   "/contact",
@@ -52,14 +53,14 @@ Router.delete(
   "/contact/:contact_id/soft",
   authenticate,
   authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
-  deleteContactController,
+  softDeleteContactController,
 );
 
 Router.delete(
   "/contact/:contact_id/permanent",
   authenticate,
   authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
-  permanentDeleteContactController,
+  hardDeleteContactController,
 );
 
 Router.post(
@@ -73,7 +74,7 @@ Router.get(
   "/contacts/deleted/list",
   authenticate,
   authorize({ user_type: "tenant", roles: tenantRoles }),
-  getDeletedContactListController,
+  getDeletedContactsController,
 );
 
 Router.post(

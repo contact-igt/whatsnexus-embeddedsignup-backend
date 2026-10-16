@@ -22,7 +22,7 @@ Router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   getDashboardController,
 );
@@ -37,7 +37,7 @@ Router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   requireAiAccess,
   getWeeklySummaryController,
@@ -54,7 +54,7 @@ Router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   requireAiAccess,
   getContactWeeklySummaryController,

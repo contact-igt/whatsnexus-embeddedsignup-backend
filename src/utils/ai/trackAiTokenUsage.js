@@ -6,7 +6,20 @@ import {
   checkUsageLimit,
   invalidateUsageCache,
 } from "../billing/usageLimiter.js";
-import { recordHealthEvent } from "../billing/billingHealthMonitor.js";
+import { recordHealthEvent, recordBillingReconciliation } from "../billing/billingHealthMonitor.js";
+import { ModelConfigurationError } from "./modelProfile.js";
+
+// Map a raw error thrown inside token tracking to a specific reconciliation reason.
+const classifyTrackingFailure = (err, stageReached) => {
+  const m = String(err?.message || "").toLowerCase();
+  if (/conversion|currency|fx|exchange/.test(m)) return "currency_conversion_failed";
+  if (/lock|deadlock|timeout/.test(m) && stageReached === "wallet") return "wallet_reservation_failed";
+  if (stageReached === "wallet") return "wallet_charge_failed";
+  if (stageReached === "ledger") return "ledger_write_failed";
+  if (stageReached === "pricing") return "pricing_snapshot_failed";
+  if (stageReached === "usage") return "usage_persistence_failed";
+  return "unknown_tracking_failure";
+};
 
 /**
  * Logs AI token usage from an OpenAI API response and deducts from wallet.
@@ -16,7 +29,7 @@ import { recordHealthEvent } from "../billing/billingHealthMonitor.js";
  * @param {string} source - Origin of the call (whatsapp, playground, classifier, knowledge, language_detect)
  * @param {object} response - The full OpenAI response object (with usage property)
  */
-export const trackAiTokenUsage = async (tenant_id, source, response) => {
+export const trackAiTokenUsage = async (tenant_id, source, response, context = null) => {
   try {
     if (!response?.usage) return;
 
@@ -25,7 +38,15 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
       completion_tokens = 0,
       total_tokens = 0,
     } = response.usage;
-    const rawModel = response.model || "gpt-4o-mini";
+    const rawModel = response.model;
+    const modelSnapshot = context ? {
+      requested_model: context.requestedModel, actual_model: context.actualModel, pricing_model: context.pricing.model,
+      pricing_rule_id: context.pricing.id, endpoint: context.endpoint, fallback_reason: context.fallbackReason,
+      input_tokens: context.usage.inputTokens, cached_input_tokens: context.usage.cachedInputTokens,
+      output_tokens: context.usage.outputTokens, reasoning_tokens: context.usage.reasoningTokens,
+      cached_input_price_per_million: context.pricing.cached_input_price_per_million,
+      outcome: context.outcome || "success",
+    } : {};
 
     // 1. Check usage limits
     const usageCheck = await checkUsageLimit(tenant_id, "ai_call");
@@ -47,11 +68,13 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
         rawModel,
         prompt_tokens,
         completion_tokens,
+        context,
       );
-      await db.AiTokenUsage.create({
+      const limitUsageRecord = await db.AiTokenUsage.create({
         tenant_id,
         model: costResult.model,
         source,
+        ...modelSnapshot,
         prompt_tokens,
         completion_tokens,
         total_tokens,
@@ -66,6 +89,19 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
         pricing_version: costResult.pricingVersion,
         billed: false,
       });
+      // Create BillingLedger entry so it appears in Transaction Ledger
+      await db.BillingLedger.create({
+        tenant_id,
+        entry_type: "ai",
+        ai_token_usage_id: limitUsageRecord.id,
+        category: "ai_usage",
+        total_cost_inr: 0,
+        markup_percent: costResult.pricingSnapshot.markup_percent,
+        usd_to_inr_rate: costResult.conversionRate,
+        conversion_rate_used: costResult.conversionRate,
+        pricing_version: costResult.pricingVersion,
+        billing_status: "usage_limit_exceeded",
+      });
       invalidateUsageCache(tenant_id);
       return;
     }
@@ -75,6 +111,7 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
       rawModel,
       prompt_tokens,
       completion_tokens,
+      context,
     );
     const model = costResult.model;
     const pricingSnapshot = costResult.pricingSnapshot;
@@ -109,6 +146,7 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
           tenant_id,
           model,
           source,
+          ...modelSnapshot,
           prompt_tokens,
           completion_tokens,
           total_tokens,
@@ -126,9 +164,31 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
         { transaction: t },
       );
 
+      if (estimatedCostInr <= 0) {
+        // Zero-cost call — still create a ledger entry for visibility
+        await db.BillingLedger.create(
+          {
+            tenant_id,
+            entry_type: "ai",
+            ai_token_usage_id: usageRecord.id,
+            category: "ai_usage",
+            total_cost_inr: 0,
+            markup_percent: appliedMarkup,
+            usd_to_inr_rate: usdToInr,
+            conversion_rate_used: usdToInr,
+            pricing_version: pricingVersion,
+            billing_status: "free",
+          },
+          { transaction: t },
+        );
+      }
+
       if (estimatedCostInr > 0) {
         if (billing_mode === "prepaid") {
           // PREPAID: Deduct from wallet with FOR UPDATE lock — NO grace, NO negative
+          let aiBillingStatus = "charged";
+          let deductNewBalance = null;
+
           const deductResult = await deductWallet(
             tenant_id,
             estimatedCostInr,
@@ -140,6 +200,7 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
           if (!deductResult.success) {
             // Mark as unbilled — usage tracked but not charged
             await usageRecord.update({ billed: false }, { transaction: t });
+            aiBillingStatus = "insufficient_balance";
 
             console.warn(
               `[AI-TOKEN-TRACKER] Prepaid deduction failed for tenant ${tenant_id}: ${deductResult.error}`,
@@ -156,30 +217,31 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
                 message: "Insufficient balance for AI usage. Please recharge.",
               });
             } catch (_) {}
-            return;
+          } else {
+            deductNewBalance = deductResult.newBalance;
+
+            // Emit real-time update
+            try {
+              const io = getIO();
+              io.to(`tenant-${tenant_id}`).emit("billing-update", {
+                type: "AI_TOKEN_USAGE",
+                tenant_id,
+                model,
+                source,
+                totalTokens: total_tokens,
+                costInr: estimatedCostInr,
+                currentBalance: deductResult.newBalance,
+                lowBalance: deductResult.newBalance < 100,
+                timestamp: new Date(),
+              });
+            } catch (_) {}
+
+            console.log(
+              `[AI-TOKEN-TRACKER] PREPAID billed ${model} for tenant ${tenant_id}: ₹${estimatedCostInr.toFixed(6)} (${total_tokens} tokens). Balance: ₹${deductResult.newBalance.toFixed(4)}`,
+            );
           }
 
-          // Emit real-time update
-          try {
-            const io = getIO();
-            io.to(`tenant-${tenant_id}`).emit("billing-update", {
-              type: "AI_TOKEN_USAGE",
-              tenant_id,
-              model,
-              source,
-              totalTokens: total_tokens,
-              costInr: estimatedCostInr,
-              currentBalance: deductResult.newBalance,
-              lowBalance: deductResult.newBalance < 100,
-              timestamp: new Date(),
-            });
-          } catch (_) {}
-
-          console.log(
-            `[AI-TOKEN-TRACKER] PREPAID billed ${model} for tenant ${tenant_id}: ₹${estimatedCostInr.toFixed(6)} (${total_tokens} tokens). Balance: ₹${deductResult.newBalance.toFixed(4)}`,
-          );
-
-          // Create BillingLedger record for AI usage
+          // Always create BillingLedger record (even on deduction failure)
           await db.BillingLedger.create(
             {
               tenant_id,
@@ -191,6 +253,7 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
               usd_to_inr_rate: usdToInr,
               conversion_rate_used: usdToInr,
               pricing_version: pricingVersion,
+              billing_status: aiBillingStatus,
             },
             { transaction: t },
           );
@@ -259,6 +322,7 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
               usd_to_inr_rate: usdToInr,
               conversion_rate_used: usdToInr,
               pricing_version: pricingVersion,
+              billing_status: "charged",
             },
             { transaction: t },
           );
@@ -368,14 +432,35 @@ export const trackAiTokenUsage = async (tenant_id, source, response) => {
     invalidateUsageCache(tenant_id);
   } catch (err) {
     console.error("[AI-TOKEN-TRACKER] Failed to log token usage:", err.message);
-    await recordHealthEvent(
-      "billing_failure",
-      tenant_id,
-      `AI token tracking failed: ${err.message}`,
-      {
-        model: response?.model,
-        stack: err.stack,
-      },
-    );
+    // A tracking / wallet / ledger failure is reconciled (structured, idempotent)
+    // AND surfaced to the caller as a controlled billing error — never a silent
+    // free call. Known non-error states (usage limit, insufficient balance) are
+    // handled above and never reach here.
+    const stageReached = /wallet|deduct|balance/i.test(err.message) ? "wallet"
+      : /ledger/i.test(err.message) ? "ledger"
+      : /conversion|currency/i.test(err.message) ? "pricing"
+      : err instanceof ModelConfigurationError ? "pricing" : "usage";
+    const reason = classifyTrackingFailure(err, stageReached);
+    await recordBillingReconciliation({
+      tenantId: tenant_id, source, reason,
+      correlationId: context?.correlationId || null,
+      requestedModel: context?.requestedModel || response?.model,
+      actualModel: context?.actualModel || response?.model,
+      actualModelMapping: context?.actualModelMapping || null,
+      pricingRuleId: context?.pricing?.id ?? null,
+      pricingVersion: context?.pricing?.pricing_version ?? null,
+      endpoint: context?.endpoint || null,
+      usage: context?.usage || null,
+      rateSnapshot: context?.pricing ? { input_rate: Number(context.pricing.input_rate), output_rate: Number(context.pricing.output_rate), cached_input_price_per_million: context.pricing.cached_input_price_per_million } : null,
+      markupSnapshot: context?.pricing ? Number(context.pricing.markup_percent) : null,
+      walletStageReached: stageReached,
+      error: err.message,
+    }).catch(() => {});
+    // recordHealthEvent kept for the existing alerting threshold, but it now
+    // references the reconciliation instead of duplicating detail.
+    await recordHealthEvent("billing_failure", tenant_id, `AI token tracking failed (${reason}) — see AI reconciliation event`, { area: "ai_token_tracking", reason, correlation_id: context?.correlationId || null }).catch(() => {});
+    const billingErr = new ModelConfigurationError("AI usage requires tariff reconciliation.", "AI_BILLING_RECONCILIATION", 502);
+    billingErr.billingReason = reason;
+    throw billingErr;
   }
 };

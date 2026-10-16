@@ -32,8 +32,13 @@ export const WhatsappAccountTable = (sequelize, Sequelize) => {
       },
 
       access_token: {
-        type: Sequelize.TEXT, // encrypted token
-        allowNull: false,
+        type: Sequelize.TEXT, // encrypted token (deprecated - now stored in tenant_secrets)
+        allowNull: true, // Made nullable since tokens are now stored in tenant_secrets
+      },
+
+      app_id: {
+        type: Sequelize.STRING,
+        allowNull: true,
       },
 
       provider: {
@@ -47,6 +52,7 @@ export const WhatsappAccountTable = (sequelize, Sequelize) => {
           "verified", // verification successful
           "active", // ready to send messages
           "inactive", // manually disabled
+          "token_error", // Meta access token invalid or insufficient permissions
           "token_expired",
           "failed",
         ),
@@ -65,12 +71,14 @@ export const WhatsappAccountTable = (sequelize, Sequelize) => {
         allowNull: true,
       },
 
-      // WhatsApp Business quality rating from Meta
+      // WhatsApp Business quality rating from Meta.
+      // "UNKNOWN" = Meta has not rated the number yet (too few messages) or the
+      // sync has not run — never assume GREEN without evidence.
       quality: {
-        type: Sequelize.ENUM("GREEN", "YELLOW", "RED"),
+        type: Sequelize.ENUM("GREEN", "YELLOW", "RED", "UNKNOWN"),
         allowNull: true,
-        defaultValue: "GREEN",
-        comment: "Meta WABA quality rating",
+        defaultValue: "UNKNOWN",
+        comment: "Meta WABA quality rating (UNKNOWN until synced from Meta)",
       },
 
       // Deployment region (e.g. Global, India, US)
@@ -81,12 +89,19 @@ export const WhatsappAccountTable = (sequelize, Sequelize) => {
         comment: "Deployment region label",
       },
 
-      // Messaging tier limit label (e.g. 1K MSG LIMIT, 10K MSG LIMIT)
+      // Meta WABA messaging tier constant: TIER_NOT_SET | TIER_2K | TIER_10K
+      // | TIER_100K | TIER_UNLIMITED. Matches META_TIER_CONFIG keys.
       tier: {
         type: Sequelize.STRING(50),
         allowNull: true,
-        defaultValue: "1K MSG LIMIT",
-        comment: "Meta WABA messaging tier",
+        defaultValue: "TIER_NOT_SET",
+        comment: "Meta WABA messaging tier constant (TIER_NOT_SET until synced)",
+      },
+
+      meta_info_synced_at: {
+        type: Sequelize.DATE,
+        allowNull: true,
+        comment: "Last successful quality/tier refresh from Meta",
       },
 
       last_error: {
@@ -94,10 +109,34 @@ export const WhatsappAccountTable = (sequelize, Sequelize) => {
         allowNull: true,
       },
 
+      // Onboarding metadata. NULL connection type is read as LEGACY_MANUAL by the
+      // application, so pre-existing rows never need to be rewritten.
+      whatsapp_connection_type: {
+        type: Sequelize.STRING(32),
+        allowNull: true,
+        comment: "LEGACY_MANUAL | EMBEDDED_STANDARD | EMBEDDED_COEXISTENCE (NULL = LEGACY_MANUAL)",
+      },
+
+      meta_business_id: {
+        type: Sequelize.STRING(64),
+        allowNull: true,
+      },
+
+      meta_embedded_config_id: {
+        type: Sequelize.STRING(64),
+        allowNull: true,
+      },
+
+      connected_at: {
+        type: Sequelize.DATE,
+        allowNull: true,
+        comment: "When an Embedded Signup connection was completed",
+      },
+
       createdAt: {
         type: Sequelize.DATE,
         allowNull: false,
-        defaultValue: Sequelize.literal("CURRENT_TIMESTAMP"),
+        defaultValue: sequelize.literal("CURRENT_TIMESTAMP"),
         field: "created_at",
       },
 

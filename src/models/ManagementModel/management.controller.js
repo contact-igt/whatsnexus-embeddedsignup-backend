@@ -43,6 +43,10 @@ import {
   checkOTPVerificationService,
 } from "../OtpVerificationModel/otpverification.service.js";
 import { DEFAULT_USD_TO_INR } from "../../config/billing.config.js";
+import {
+  getUserPreferencesService,
+  upsertUserPreferencesService,
+} from "../UserPreferencesModel/userPreferences.service.js";
 
 export const registerManagementController = async (req, res) => {
   try {
@@ -152,6 +156,12 @@ export const loginManagementController = async (req, res) => {
       });
     }
 
+    if (user.status !== "active") {
+      return res.status(403).send({
+        message: "Your account is inactive. Please contact administrator.",
+      });
+    }
+
     const isMatch = await bcrypt.compare(trimmedPassword, user.password);
 
     if (!isMatch) {
@@ -170,6 +180,12 @@ export const loginManagementController = async (req, res) => {
 
     const userDetails = { ...user, user_type: "management" };
     delete userDetails.password;
+
+    const userPrefs = await getUserPreferencesService(
+      user.management_id,
+      "management",
+    );
+    userDetails.preferences = { theme: userPrefs?.theme || "light" };
 
     return res.status(200).send({
       message: "Login successful",
@@ -259,9 +275,72 @@ export const getLoggedManagementController = async (req, res) => {
     const userDetails = { ...data, user_type: "management" };
     delete userDetails.password;
 
+    const userPrefs = await getUserPreferencesService(unique_id, "management");
+    userDetails.preferences = { theme: userPrefs?.theme || "light" };
+
     return res.status(200).send({
       message: "Logged-in management profile fetched successfully",
       data: userDetails,
+    });
+  } catch (err) {
+    return res.status(500).send({ message: err.message });
+  }
+};
+
+export const getLoggedManagementPreferencesController = async (req, res) => {
+  try {
+    const { unique_id } = req.user;
+
+    if (!unique_id) {
+      return res.status(400).send({
+        message: "Management ID not found in session",
+      });
+    }
+
+    const userPrefs = await getUserPreferencesService(unique_id, "management");
+
+    return res.status(200).send({
+      message: "Management preferences fetched successfully",
+      data: {
+        theme: userPrefs?.theme || "light",
+      },
+    });
+  } catch (err) {
+    return res.status(500).send({ message: err.message });
+  }
+};
+
+export const updateLoggedManagementPreferencesController = async (req, res) => {
+  try {
+    const { unique_id } = req.user;
+    const { preferences } = req.body;
+
+    if (!unique_id) {
+      return res.status(400).send({
+        message: "Management ID not found in session",
+      });
+    }
+
+    if (!preferences || typeof preferences !== "object") {
+      return res.status(400).send({
+        message: "Preferences payload is required",
+      });
+    }
+
+    await upsertUserPreferencesService(
+      unique_id,
+      null,
+      preferences,
+      "management",
+    );
+
+    const updatedPrefs = await getUserPreferencesService(unique_id, "management");
+
+    return res.status(200).send({
+      message: "Management preferences updated successfully",
+      data: {
+        theme: updatedPrefs?.theme || "light",
+      },
     });
   } catch (err) {
     return res.status(500).send({ message: err.message });
@@ -273,7 +352,8 @@ export const updateManagementController = async (req, res) => {
     const loggedInUser = req.user;
     const targetUserId = req.params.id;
 
-    const { title, username, country_code, mobile, profile } = req.body;
+    const { title, username, country_code, mobile, profile, preferences } =
+      req.body;
 
     if (loggedInUser.role === "platform_admin") {
       if (targetUserId !== loggedInUser.unique_id) {
@@ -304,25 +384,62 @@ export const updateManagementController = async (req, res) => {
       }
     }
 
-    const cleanedCC = country_code ? cleanCountryCode(country_code) : null;
+    if (preferences && targetUserId !== loggedInUser.unique_id) {
+      return res.status(403).send({
+        message: "You can update preferences only for your own account",
+      });
+    }
 
-    await updateManagementService(
-      targetUserId,
-      title,
-      username,
-      cleanedCC,
-      normalizeMobile(cleanedCC, mobile),
-      profile,
-      loggedInUser.role === "super_admin" && req.body.role
-        ? req.body.role
-        : null,
-      loggedInUser.role === "super_admin" && req.body.status
-        ? req.body.status
-        : null,
+    const cleanedCC = country_code ? cleanCountryCode(country_code) : null;
+    const hasProfileUpdates = Boolean(
+      title ||
+        username ||
+        country_code ||
+        mobile ||
+        profile ||
+        (loggedInUser.role === "super_admin" && req.body.role) ||
+        (loggedInUser.role === "super_admin" && req.body.status),
     );
+
+    if (hasProfileUpdates) {
+      await updateManagementService(
+        targetUserId,
+        title,
+        username,
+        cleanedCC,
+        mobile ? normalizeMobile(cleanedCC, mobile) : null,
+        profile,
+        loggedInUser.role === "super_admin" && req.body.role
+          ? req.body.role
+          : null,
+        loggedInUser.role === "super_admin" && req.body.status
+          ? req.body.status
+          : null,
+      );
+    }
+
+    if (preferences && typeof preferences === "object") {
+      await upsertUserPreferencesService(
+        targetUserId,
+        null,
+        preferences,
+        "management",
+      );
+    }
+
+    const updatedUser = await getManagementByIdService(targetUserId);
+    if (updatedUser) {
+      delete updatedUser.password;
+      const updatedPrefs = await getUserPreferencesService(
+        targetUserId,
+        "management",
+      );
+      updatedUser.preferences = { theme: updatedPrefs?.theme || "light" };
+    }
 
     return res.status(200).send({
       message: "Management profile updated successfully",
+      data: updatedUser ? { ...updatedUser, user_type: "management" } : null,
     });
   } catch (err) {
     if (err.original?.code === "ER_DUP_ENTRY") {
@@ -658,25 +775,26 @@ export const createAiPricingRuleController = async (req, res) => {
       });
     }
 
-    const trimmedModel = model.trim().toLowerCase();
+    if (typeof model !== "string") return res.status(400).json({ success: false, message: "Invalid model ID" });
+    const trimmedModel = model.trim();
     if (!trimmedModel) {
       return res
         .status(400)
         .json({ success: false, message: "Model name cannot be empty" });
     }
 
-    const parsedInputRate = parseFloat(input_rate);
-    const parsedOutputRate = parseFloat(output_rate);
-    if (isNaN(parsedInputRate) || parsedInputRate <= 0) {
+    const parsedInputRate = Number(input_rate);
+    const parsedOutputRate = Number(output_rate);
+    if (!Number.isFinite(parsedInputRate) || parsedInputRate < 0) {
       return res.status(400).json({
         success: false,
-        message: "Input rate must be greater than zero",
+        message: "Input rate must be non-negative",
       });
     }
-    if (isNaN(parsedOutputRate) || parsedOutputRate <= 0) {
+    if (!Number.isFinite(parsedOutputRate) || parsedOutputRate < 0) {
       return res.status(400).json({
         success: false,
-        message: "Output rate must be greater than zero",
+        message: "Output rate must be non-negative",
       });
     }
 
@@ -716,6 +834,8 @@ export const createAiPricingRuleController = async (req, res) => {
       description || null,
       finalRecommendedFor,
       finalCategory,
+      req.body.cached_input_price_per_million ?? null,
+      req.user?.management_id || req.user?.unique_id || req.user?.id || null,
     );
     return res
       .status(201)
@@ -780,6 +900,7 @@ export const updateAiPricingRuleController = async (req, res) => {
     const VALID_CATEGORY = ["premium", "mid-tier", "budget", "reasoning"];
 
     const rule = await updateAiPricingRuleService(id, {
+      cached_input_price_per_million: req.body.cached_input_price_per_million,
       input_rate: input_rate !== undefined ? parseFloat(input_rate) : undefined,
       output_rate:
         output_rate !== undefined ? parseFloat(output_rate) : undefined,
@@ -787,7 +908,7 @@ export const updateAiPricingRuleController = async (req, res) => {
         markup_percent !== undefined ? parseFloat(markup_percent) : undefined,
       usd_to_inr_rate:
         usd_to_inr_rate !== undefined ? parseFloat(usd_to_inr_rate) : undefined,
-      is_active,
+      is_active: is_active === false || is_active === "false" ? false : is_active === undefined ? undefined : true,
       description: description !== undefined ? description : undefined,
       recommended_for:
         recommended_for !== undefined &&
@@ -798,7 +919,7 @@ export const updateAiPricingRuleController = async (req, res) => {
         category !== undefined && VALID_CATEGORY.includes(category)
           ? category
           : undefined,
-    });
+    }, req.user?.management_id || req.user?.unique_id || req.user?.id || null);
     return res
       .status(200)
       .json({ success: true, message: "AI pricing rule updated", data: rule });
@@ -810,10 +931,10 @@ export const updateAiPricingRuleController = async (req, res) => {
 export const deleteAiPricingRuleController = async (req, res) => {
   try {
     const { id } = req.params;
-    await deleteAiPricingRuleService(id);
+    await deleteAiPricingRuleService(id, req.user?.management_id || req.user?.unique_id || req.user?.id || null);
     return res
       .status(200)
-      .json({ success: true, message: "AI pricing rule deleted" });
+      .json({ success: true, message: "AI pricing rule archived" });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }

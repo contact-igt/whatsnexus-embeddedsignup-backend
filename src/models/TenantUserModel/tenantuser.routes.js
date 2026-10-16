@@ -14,6 +14,8 @@ import {
   getDeletedTenantUserListController,
   restoreTenantUserController,
   getLoggedTenantUserController,
+  getLoggedTenantUserPreferencesController,
+  updateLoggedTenantUserPreferencesController,
   updateTenantOrganizationController,
   updateLoggedTenantProfileController,
     forgotTenantPasswordController,
@@ -40,9 +42,29 @@ Router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   getLoggedTenantUserController,
+);
+
+Router.get(
+  "/user/preferences",
+  authenticate,
+  authorize({
+    user_type: "tenant",
+    roles: ["tenant_admin" , "staff"],
+  }),
+  getLoggedTenantUserPreferencesController,
+);
+
+Router.put(
+  "/user/preferences",
+  authenticate,
+  authorize({
+    user_type: "tenant",
+    roles: ["tenant_admin" , "staff"],
+  }),
+  updateLoggedTenantUserPreferencesController,
 );
 
 Router.put(
@@ -50,7 +72,7 @@ Router.put(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   updateLoggedTenantProfileController,
 );
@@ -70,7 +92,7 @@ Router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   getAllTenantUsersController,
 );
@@ -80,7 +102,7 @@ Router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   getTenantUserByIdController,
 );
@@ -90,7 +112,7 @@ Router.put(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   updateTenantUserByIdController,
 );
@@ -110,7 +132,7 @@ Router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   getDeletedTenantUserListController,
 );
@@ -135,8 +157,6 @@ Router.delete(
   }),
   permanentDeleteTenantUserController,
 );
-
-
 
 Router.post("/user/forgot-password", forgotTenantPasswordController);
 Router.post("/user/verify-otp", verifyTenantOTPController);

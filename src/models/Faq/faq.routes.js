@@ -19,8 +19,7 @@ import {
 } from "../../middlewares/auth/authMiddlewares.js";
 
 const router = express.Router();
-
-const managerRoles = ["tenant_admin", "staff", "doctor"];
+const managerRoles = ["tenant_admin", "staff"];
 
 // GET  /faq-reviews
 router.get(

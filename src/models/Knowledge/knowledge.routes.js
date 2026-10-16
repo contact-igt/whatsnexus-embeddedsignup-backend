@@ -1,16 +1,18 @@
 import express from "express";
 import {
-  deleteKnowledge,
-  permanentDeleteKnowledge,
   getKnowledgeById,
   listKnowledge,
   searchKnowledgeChunksController,
   updateKnowledge,
   updateKnowledgeStatusController,
   uploadKnowledge,
-  getDeletedKnowledgeController,
-  restoreKnowledgeController,
 } from "./knowledge.controller.js";
+import {
+  softDeleteKnowledgeSourceController,
+  hardDeleteKnowledgeSourceController,
+  restoreKnowledgeSourceController,
+  getDeletedKnowledgeSourcesController,
+} from "./knowledge.lifecycle.js";
 import {
   authenticate,
   authorize,
@@ -18,15 +20,14 @@ import {
 import { requireAiAccess } from "../../middlewares/billing/billingAccessGuard.js";
 
 const router = express.Router();
-
-const tenantRoles = ["tenant_admin", "doctor", "staff", "agent"];
+const tenantRoles = ["tenant_admin", "staff"];
 const managerRoles = ["tenant_admin", "staff"];
 
 router.get(
   "/knowledges/deleted/list",
   authenticate,
   authorize({ user_type: "tenant", roles: managerRoles }),
-  getDeletedKnowledgeController,
+  getDeletedKnowledgeSourcesController,
 );
 
 router.post(
@@ -57,19 +58,19 @@ router.delete(
   "/knowledge/:id/soft",
   authenticate,
   authorize({ user_type: "tenant", roles: managerRoles }),
-  deleteKnowledge,
+  softDeleteKnowledgeSourceController,
 );
 router.delete(
   "/knowledge/:id/permanent",
   authenticate,
   authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
-  permanentDeleteKnowledge,
+  hardDeleteKnowledgeSourceController,
 );
 router.post(
   "/knowledge/:id/restore",
   authenticate,
   authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
-  restoreKnowledgeController,
+  restoreKnowledgeSourceController,
 );
 router.put(
   "/knowledge-status/:id",

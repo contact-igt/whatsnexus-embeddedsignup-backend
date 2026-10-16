@@ -73,40 +73,19 @@
 import db from "../../database/index.js";
 import { tableNames } from "../../database/tableName.js";
 import axios from "axios";
+import { storeSecret, getSecret } from "../TenantSecretsModel/tenantSecrets.service.js";
+import {
+  isPersistableMetaTier,
+  resolveMetaTier,
+} from "../../utils/metaMessagingTier.js";
+
+const META_API_VERSION = process.env.META_API_VERSION || "v25.0";
 
 /**
  * Tier label map: Meta whatsapp_business_manager_messaging_limit → UI label + daily unique-user limit
  * Source of truth: WABA-level (portfolio), shared across all phone numbers.
  * Updated for Meta's 2025+ tier model.
  */
-export const META_TIER_CONFIG = {
-  TIER_NOT_SET: {
-    name: "Trial",
-    limit: 250,
-    upgradeHint: "Send 2,000 unique users in 30 days OR verify your business",
-  },
-  TIER_2K: {
-    name: "Standard",
-    limit: 2000,
-    upgradeHint: "Reach 1,000 unique users in last 7 days & maintain GREEN quality",
-  },
-  TIER_10K: {
-    name: "Growth",
-    limit: 10000,
-    upgradeHint: "Reach 5,000 unique users in last 7 days & maintain GREEN quality",
-  },
-  TIER_100K: {
-    name: "Scale",
-    limit: 100000,
-    upgradeHint: "Reach 50,000 unique users in last 7 days & maintain GREEN quality",
-  },
-  TIER_UNLIMITED: {
-    name: "Unlimited",
-    limit: Infinity,
-    upgradeHint: null,
-  },
-};
-
 /**
  * Syncs quality_rating and messaging limit tier from Meta for the tenant's phone number.
  *
@@ -124,25 +103,51 @@ export const META_TIER_CONFIG = {
  */
 export const syncWabaMetaInfoService = async (tenant_id) => {
   try {
-    // 1. Fetch phone_number_id and access_token from DB
     const account = await db.Whatsappaccount.findOne({
       where: { tenant_id, is_deleted: false },
-      attributes: ["id", "phone_number_id", "access_token"],
+      attributes: [
+        "id",
+        "phone_number_id",
+        "waba_id",
+        "quality",
+        "tier",
+        "meta_info_synced_at",
+      ],
       raw: true,
     });
 
-    if (!account || !account.phone_number_id || !account.access_token) {
+    if (!account || !account.phone_number_id) {
       throw new Error("No active WhatsApp account found for this tenant.");
     }
 
-    // 2. Call Meta Graph API — use new field whatsapp_business_manager_messaging_limit
+    const lastSync = account.meta_info_synced_at
+      ? new Date(account.meta_info_synced_at)
+      : null;
+    if (lastSync && Date.now() - lastSync.getTime() < 5 * 60 * 1000) {
+      return {
+        quality: account.quality || "UNKNOWN",
+        tier: account.tier || "TIER_NOT_SET",
+        raw_tier: account.tier || null,
+        synced_at: lastSync,
+        source: "cache",
+        ...resolveMetaTier(account.tier),
+      };
+    }
+
+    // Decrypt only at point of use — never log
+    const access_token = await getSecret(tenant_id, "whatsapp");
+    if (!access_token) {
+      throw new Error("WhatsApp access token not found in secrets store.");
+    }
+
+    // 2. Call Meta Graph API — decrypt only at point of use
     const metaResponse = await axios.get(
-      `https://graph.facebook.com/v25.0/${account.phone_number_id}`,
+      `https://graph.facebook.com/${META_API_VERSION}/${account.phone_number_id}`,
       {
         params: {
           fields:
             "display_phone_number,quality_rating,whatsapp_business_manager_messaging_limit,code_verification_status",
-          access_token: account.access_token,
+          access_token,
         },
         timeout: 8000,
       },
@@ -150,26 +155,45 @@ export const syncWabaMetaInfoService = async (tenant_id) => {
 
     const { quality_rating, whatsapp_business_manager_messaging_limit } = metaResponse.data;
 
-    // 3. Map Meta values to DB-friendly values
-    const qualityForDb = ["GREEN", "YELLOW", "RED"].includes(quality_rating)
+    // 3. Map Meta values to DB-friendly values.
+    // Meta returns "UNKNOWN" (or omits the field) for numbers that have not sent
+    // enough messages yet — keep that as-is instead of pretending it is GREEN.
+    const qualityForDb = ["GREEN", "YELLOW", "RED", "UNKNOWN"].includes(
+      quality_rating,
+    )
       ? quality_rating
-      : "GREEN";
+      : account.quality || "UNKNOWN";
 
     // whatsapp_business_manager_messaging_limit returns values like TIER_NOT_SET, TIER_2K, TIER_10K, etc.
-    const tierRaw = whatsapp_business_manager_messaging_limit || "TIER_NOT_SET";
-    const tierLabel = META_TIER_CONFIG[tierRaw] ? tierRaw : "TIER_NOT_SET";
-    console.log(`[WABA Sync] tier=${tierLabel} (raw: ${tierRaw}), quality=${qualityForDb}`);
+    const tierRaw = whatsapp_business_manager_messaging_limit || null;
+    const tierForDb = isPersistableMetaTier(tierRaw) ? tierRaw : account.tier;
+    const syncedAt = new Date();
 
-    // 4. Update the WhatsappAccount row
-    await db.Whatsappaccount.update(
-      { quality: qualityForDb, tier: tierLabel },
-      { where: { id: account.id } },
-    );
+    // 4. Persist so the dashboard and campaign-safety checks read real values,
+    //    not the column defaults. Best-effort — never block on a write failure.
+    try {
+      await db.Whatsappaccount.update(
+        {
+          quality: qualityForDb,
+          ...(tierForDb ? { tier: tierForDb } : {}),
+          meta_info_synced_at: syncedAt,
+        },
+        { where: { id: account.id } },
+      );
+    } catch (writeErr) {
+      console.error(
+        "[WABA Sync] Failed to persist quality/tier:",
+        writeErr.message,
+      );
+    }
 
     return {
       quality: qualityForDb,
-      tier: tierLabel,
+      tier: tierForDb || "TIER_NOT_SET",
       raw_tier: tierRaw,
+      synced_at: syncedAt,
+      source: "meta",
+      ...resolveMetaTier(tierForDb),
     };
   } catch (err) {
     // Non-blocking: log but don't crash — dashboard still works with DB fallback values
@@ -187,52 +211,44 @@ export const createOrUpdateWhatsappAccountService = async (
   phone_number_id,
   waba_id,
   access_token,
+  app_id,
 ) => {
   try {
-    // 1️⃣ Check if this exact account (whatsapp_number or phone_number_id) is already registered by ANY tenant
+    // Check if this exact account is already registered by ANOTHER tenant
     const [existingAccounts] = await db.sequelize.query(
-      `SELECT tenant_id, whatsapp_number, phone_number_id FROM ${tableNames.WHATSAPP_ACCOUNT} 
+      `SELECT tenant_id, whatsapp_number, phone_number_id FROM ${tableNames.WHATSAPP_ACCOUNT}
        WHERE (whatsapp_number = ? OR phone_number_id = ?) AND is_deleted = false LIMIT 1`,
       { replacements: [whatsapp_number, phone_number_id] },
     );
 
     if (existingAccounts.length > 0) {
       const existing = existingAccounts[0];
-
-      if (existing.tenant_id === tenant_id) {
-        throw new Error(
-          "This WhatsApp account is already linked to your profile.",
-        );
-      } else {
-        throw new Error(
-          "This WhatsApp number or Phone ID is already registered by another user.",
-        );
+      if (existing.tenant_id !== tenant_id) {
+        throw new Error("This WhatsApp number or Phone ID is already registered by another user.");
       }
+      // Same tenant — fall through to the ON DUPLICATE KEY UPDATE upsert below
     }
 
-    // 2️⃣ If no duplicates, proceed with Insert or Update
+    // Insert or update account row — access_token is never stored in this table
     const Query = `
-    INSERT INTO ${tableNames.WHATSAPP_ACCOUNT}
-    (tenant_id, whatsapp_number, phone_number_id, waba_id, access_token, status)
-    VALUES (?, ?, ?, ?, ?, 'pending')
-    ON DUPLICATE KEY UPDATE
-      whatsapp_number = VALUES(whatsapp_number),
-      phone_number_id = VALUES(phone_number_id),
-      waba_id = VALUES(waba_id),
-      access_token = VALUES(access_token),
-      status = 'pending',
-      last_error = NULL
-  `;
+      INSERT INTO ${tableNames.WHATSAPP_ACCOUNT}
+        (tenant_id, whatsapp_number, phone_number_id, waba_id, app_id, status)
+      VALUES (?, ?, ?, ?, ?, 'pending')
+      ON DUPLICATE KEY UPDATE
+        whatsapp_number = VALUES(whatsapp_number),
+        phone_number_id = VALUES(phone_number_id),
+        waba_id         = VALUES(waba_id),
+        app_id          = VALUES(app_id),
+        status          = 'pending',
+        last_error      = NULL
+    `;
 
     await db.sequelize.query(Query, {
-      replacements: [
-        tenant_id,
-        whatsapp_number,
-        phone_number_id,
-        waba_id,
-        access_token,
-      ],
+      replacements: [tenant_id, whatsapp_number, phone_number_id, waba_id, app_id],
     });
+
+    // Encrypt and store the access token in tenant_secrets (AES-256-GCM)
+    await storeSecret(tenant_id, "whatsapp", access_token);
   } catch (err) {
     throw err;
   }
@@ -244,7 +260,14 @@ export const getWhatsappAccountByTenantService = async (tenant_id) => {
       `SELECT * FROM ${tableNames.WHATSAPP_ACCOUNT} WHERE tenant_id = ? AND is_deleted = false LIMIT 1`,
       { replacements: [tenant_id] },
     );
-    return rows[0];
+    const account = rows[0];
+    if (!account) return null;
+
+    // Attach decrypted token for internal use only — never reaches frontend directly
+    const token = await getSecret(tenant_id, "whatsapp");
+    account.access_token = token || null;
+
+    return account;
   } catch (err) {
     throw err;
   }
@@ -304,11 +327,72 @@ export const permanentDeleteWhatsappAccountService = async (tenant_id) => {
 
 export const updateAccessTokenService = async (tenant_id, access_token) => {
   try {
-    const [result] = await db.sequelize.query(
-      `UPDATE ${tableNames.WHATSAPP_ACCOUNT} SET access_token = ?, status = 'pending', last_error = NULL WHERE tenant_id = ? AND is_deleted = false`,
-      { replacements: [access_token, tenant_id] },
+    // Store encrypted in tenant_secrets; reset account status so re-test is required
+    await storeSecret(tenant_id, "whatsapp", access_token);
+    await db.sequelize.query(
+      `UPDATE ${tableNames.WHATSAPP_ACCOUNT}
+       SET status = 'pending', last_error = NULL
+       WHERE tenant_id = ? AND is_deleted = false`,
+      { replacements: [tenant_id] },
     );
-    return result;
+  } catch (err) {
+    throw err;
+  }
+};
+
+export const updateWhatsappAccountService = async (tenant_id, { waba_id, phone_number_id, whatsapp_number, app_id, access_token }) => {
+  try {
+    // Check if the new identifiers conflict with another tenant
+    if (whatsapp_number || phone_number_id) {
+      const conditions = [];
+      const replacements = [];
+      if (whatsapp_number) { conditions.push("whatsapp_number = ?"); replacements.push(whatsapp_number); }
+      if (phone_number_id) { conditions.push("phone_number_id = ?"); replacements.push(phone_number_id); }
+
+      if (conditions.length > 0) {
+        const [conflicts] = await db.sequelize.query(
+          `SELECT tenant_id FROM ${tableNames.WHATSAPP_ACCOUNT}
+           WHERE (${conditions.join(" OR ")}) AND tenant_id != ? AND is_deleted = false LIMIT 1`,
+          { replacements: [...replacements, tenant_id] },
+        );
+        if (conflicts.length > 0) {
+          throw new Error("This WhatsApp number or Phone ID is already registered by another user.");
+        }
+      }
+    }
+
+    const setClauses = [];
+    const replacements = [];
+
+    if (waba_id !== undefined)        { setClauses.push("waba_id = ?");          replacements.push(waba_id); }
+    if (phone_number_id !== undefined) { setClauses.push("phone_number_id = ?"); replacements.push(phone_number_id); }
+    if (whatsapp_number !== undefined) { setClauses.push("whatsapp_number = ?"); replacements.push(whatsapp_number); }
+    if (app_id !== undefined)          { setClauses.push("app_id = ?");          replacements.push(app_id); }
+
+    if (setClauses.length > 0) {
+      setClauses.push("status = 'pending'");
+      setClauses.push("last_error = NULL");
+      replacements.push(tenant_id);
+
+      await db.sequelize.query(
+        `UPDATE ${tableNames.WHATSAPP_ACCOUNT}
+         SET ${setClauses.join(", ")}
+         WHERE tenant_id = ? AND is_deleted = false`,
+        { replacements },
+      );
+    }
+
+    // Store new token in tenant_secrets if provided
+    if (access_token) {
+      await storeSecret(tenant_id, "whatsapp", access_token);
+      // Ensure status resets even if no other fields changed
+      await db.sequelize.query(
+        `UPDATE ${tableNames.WHATSAPP_ACCOUNT}
+         SET status = 'pending', last_error = NULL
+         WHERE tenant_id = ? AND is_deleted = false`,
+        { replacements: [tenant_id] },
+      );
+    }
   } catch (err) {
     throw err;
   }
@@ -333,7 +417,7 @@ export const getTenantByPhoneNumberIdService = async (phone_number_id) => {
  */
 export const validateAccessTokenService = async (access_token) => {
   try {
-    const response = await axios.get("https://graph.facebook.com/v19.0/me", {
+    const response = await axios.get(`https://graph.facebook.com/${META_API_VERSION}/me`, {
       params: { access_token },
       timeout: 8000,
     });
@@ -367,7 +451,7 @@ export const validateMetaSubscriptionService = async (
 ) => {
   try {
     const response = await axios.get(
-      `https://graph.facebook.com/v19.0/${waba_id}/subscribed_apps`,
+      `https://graph.facebook.com/${META_API_VERSION}/${waba_id}/subscribed_apps`,
       {
         params: { access_token },
         timeout: 8000,
@@ -415,7 +499,7 @@ export const subscribeToWebhookFieldsService = async (
 ) => {
   try {
     const response = await axios.post(
-      `https://graph.facebook.com/v19.0/${waba_id}/subscribed_apps`,
+      `https://graph.facebook.com/${META_API_VERSION}/${waba_id}/subscribed_apps`,
       null,
       {
         params: { access_token },

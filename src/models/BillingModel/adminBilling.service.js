@@ -1,6 +1,7 @@
 import db from "../../database/index.js";
 import { getIO } from "../../middlewares/socket/socket.js";
 import { initBillingCycle, closeBillingCycle } from "./billingCycle.service.js";
+import { logger } from "../../utils/logger.js";
 
 /**
  * Force unlock access for a tenant.
@@ -12,7 +13,7 @@ export const forceUnlockAccess = async (admin_id, tenant_id, reason) => {
   // Capture before state
   const overdueInvoices = await db.MonthlyInvoices.findAll({
     where: { tenant_id, status: "overdue" },
-    attributes: ["id", "invoice_number", "status"],
+    attributes: ["id", "invoice_number", "status", "due_date"],
     raw: true,
   });
 
@@ -22,9 +23,12 @@ export const forceUnlockAccess = async (admin_id, tenant_id, reason) => {
     raw: true,
   });
 
-  // Reset overdue invoices to unpaid
+  // Force-unlock grants a bounded grace period; changing only the status would
+  // still be blocked immediately because the original due_date is in the past.
+  const graceDays = Math.max(1, Number(process.env.FORCE_UNLOCK_GRACE_DAYS) || 7);
+  const graceDueDate = new Date(Date.now() + graceDays * 24 * 60 * 60 * 1000);
   await db.MonthlyInvoices.update(
-    { status: "unpaid" },
+    { status: "unpaid", due_date: graceDueDate },
     { where: { tenant_id, status: "overdue" } },
   );
 
@@ -44,7 +48,7 @@ export const forceUnlockAccess = async (admin_id, tenant_id, reason) => {
       locked_cycles_unlocked: lockedCycles.length,
     },
     before_state: { overdueInvoices, lockedCycles },
-    after_state: { all_invoices_unpaid: true, all_cycles_unlocked: true },
+    after_state: { all_invoices_unpaid: true, all_cycles_unlocked: true, grace_due_date: graceDueDate },
     reason,
   });
 
@@ -54,7 +58,7 @@ export const forceUnlockAccess = async (admin_id, tenant_id, reason) => {
     io.to(`tenant-${tenant_id}`).emit("access-restored", { tenant_id });
   } catch (_) {}
 
-  console.log(
+  logger.info(
     `[ADMIN-BILLING] force_unlock by ${admin_id} for tenant ${tenant_id}: ${reason}`,
   );
 
@@ -129,7 +133,7 @@ export const manualWalletCredit = async (
     });
   } catch (_) {}
 
-  console.log(
+  logger.info(
     `[ADMIN-BILLING] manual_credit by ${admin_id}: ₹${amountInRupees.toFixed(2)} to tenant ${tenant_id}. Reason: ${reason}`,
   );
 
@@ -167,7 +171,7 @@ export const manualInvoiceClose = async (admin_id, invoice_id, reason) => {
     reason,
   });
 
-  console.log(
+  logger.info(
     `[ADMIN-BILLING] manual_invoice_close by ${admin_id}: ${invoice.invoice_number}. Reason: ${reason}`,
   );
 
@@ -198,14 +202,20 @@ export const changeBillingMode = async (
   }
 
   await db.sequelize.transaction(async (t) => {
+    const lockedTenant = await db.Tenants.findOne({
+      where: { tenant_id },
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+    if (!lockedTenant) throw new Error("Tenant not found");
     // Switch to postpaid → initialize billing cycle + set credit limit
     if (new_mode === "postpaid") {
       await initBillingCycle(tenant_id, t);
-      await tenant.update(
+      await lockedTenant.update(
         {
           billing_mode: new_mode,
           postpaid_credit_limit:
-            parseFloat(tenant.postpaid_credit_limit) || 5000,
+            parseFloat(lockedTenant.postpaid_credit_limit) || 5000,
         },
         { transaction: t },
       );
@@ -213,14 +223,18 @@ export const changeBillingMode = async (
 
     // Switch to prepaid → close active cycle + generate final invoice + cleanup
     if (new_mode === "prepaid") {
+      const inFlightPostpaidHolds = await db.BillingHolds.count({
+        where: { tenant_id, billing_mode: "postpaid", status: "active" },
+        transaction: t,
+      });
       const activeCycle = await db.BillingCycles.findOne({
         where: { tenant_id, status: "active" },
         transaction: t,
       });
-      if (activeCycle) {
+      // Preserve the old cycle while authorized postpaid sends are in flight;
+      // their delayed webhooks must remain attributable to that cycle.
+      if (activeCycle && inFlightPostpaidHolds === 0) {
         await closeBillingCycle(tenant_id, activeCycle.id, t);
-
-        // Delete the auto-created next cycle since we're leaving postpaid
         await db.BillingCycles.destroy({
           where: { tenant_id, status: "active" },
           transaction: t,
@@ -228,7 +242,7 @@ export const changeBillingMode = async (
       }
 
       // Clear stale cycle dates and switch mode
-      await tenant.update(
+      await lockedTenant.update(
         {
           billing_mode: new_mode,
           billing_cycle_start: null,
@@ -267,7 +281,7 @@ export const changeBillingMode = async (
     });
   } catch (_) {}
 
-  console.log(
+  logger.info(
     `[ADMIN-BILLING] billing_mode_change by ${admin_id}: ${old_mode} → ${new_mode} for tenant ${tenant_id}. Reason: ${reason}`,
   );
 
@@ -329,7 +343,7 @@ export const updateUsageLimits = async (admin_id, tenant_id, limits) => {
     });
   } catch (_) {}
 
-  console.log(
+  logger.info(
     `[ADMIN-BILLING] update_usage_limits by ${admin_id} for tenant ${tenant_id}:`,
     updateData,
   );

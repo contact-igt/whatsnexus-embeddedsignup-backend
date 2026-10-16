@@ -1,25 +1,76 @@
-import axios from "axios";
+﻿import axios from "axios";
 import https from "https";
+import FormData from "form-data";
 import db from "../../database/index.js";
 import { tableNames } from "../../database/tableName.js";
+import { getSecret } from "../TenantSecretsModel/tenantSecrets.service.js";
 import { buildAiSystemPrompt } from "../../utils/ai/aiFlowHelper.js";
 import { getConversationMemory } from "../Messages/messages.memory.js";
 import { detectLanguageAI } from "../../utils/ai/detectLanguageStyle.js";
 import { buildChatHistory } from "../../utils/chat/buildChatHistory.js";
 import { processResponse } from "../../utils/ai/aiTagHandlers/index.js";
 import { callAI } from "../../utils/ai/coreAi.js";
+import { MISSING_INFO_FALLBACK_REPLY } from "../../utils/ai/prompts/system.js";
 import { searchKnowledgeChunks } from "../Knowledge/knowledge.search.js";
 import { getActivePromptService } from "../AiPrompt/aiprompt.service.js";
 import { getIO } from "../../middlewares/socket/socket.js";
 import { classifyIntent } from "../../utils/ai/intentClassifier.js";
+import {
+  buildAvailableDoctorListAppointmentResponse,
+} from "../AppointmentModel/Advanced_Appointment_Booking.service.js";
+import {
+  hasAppointmentStartSignal,
+  isContextualPositiveBookingReply,
+  isDoctorListRequest,
+  isPureSmallTalkMessage,
+} from "../AppointmentModel/appointmentRoutingGuard.service.js";
+import {
+  hasManageAppointmentStartSignal,
+} from "../AppointmentModel/manageAppointmentRoutingGuard.service.js";
+import {
+  APPOINTMENT_OPERATION_ROUTES,
+  APPOINTMENT_OPERATION_SOURCES,
+  getAppointmentOperationRouterMode,
+  isAppointmentOperationSafetyEnabled,
+} from "../AppointmentModel/appointmentOperationRouter.service.js";
+import {
+  confirmMetaMessagingReservation,
+  releaseMetaMessagingReservation,
+  reserveMetaMessagingRecipient,
+} from "../../services/metaMessagingLimit.service.js";
 
 const httpsAgent = new https.Agent({
   family: 4,
   keepAlive: true,
 });
 
-const FIXED_MISSING_INFO_FALLBACK =
-  "Our team will get back to you shortly. Please feel free to ask any other questions in the meantime ?";
+const META_GRAPH_BASE_URL = "https://graph.facebook.com";
+const META_API_VERSION = process.env.META_API_VERSION || "v25.0";
+const DEFAULT_META_REQUEST_TIMEOUT_MS = 30000;
+
+const buildMetaMessagesUrl = (apiVersion, phoneNumberId) =>
+  `${META_GRAPH_BASE_URL}/${apiVersion}/${phoneNumberId}/messages`;
+
+const buildMetaSendRequestConfig = (accessToken) => ({
+  headers: {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+  },
+  httpsAgent,
+  proxy: false,
+  timeout: Number(process.env.META_REQUEST_TIMEOUT_MS || DEFAULT_META_REQUEST_TIMEOUT_MS),
+});
+
+const sanitizeMetaErrorBody = (body) => {
+  if (!body || typeof body !== "object") return body || null;
+  return JSON.parse(
+    JSON.stringify(body, (key, value) =>
+      String(key).toLowerCase().includes("token") ? "[redacted]" : value,
+    ),
+  );
+};
+
+const FIXED_MISSING_INFO_FALLBACK = MISSING_INFO_FALLBACK_REPLY;
 
 const FACTUAL_KEYWORD_PATTERN =
   /\b(price|cost|fee|fees|timing|timings|hours|open|close|policy|policies|service|services|treatment|treatments|procedure|procedures|operation|surgery|medication|medicine|diet|drink|drinks|food|before|after|insurance|package|offer|facility|facilities|address|location|contact|refund|payment|emi|warranty|guarantee|side effects?)\b/i;
@@ -27,6 +78,15 @@ const FACTUAL_INTENT_PATTERN =
   /\b(what|when|where|which|who|how\s+much|how\s+many|how\s+long)\b/i;
 const SMALLTALK_PATTERN =
   /^(hi|hello|hey|thanks|thank you|ok|okay|bye|good morning|good afternoon|good evening|how are you)\b/i;
+const APPOINTMENT_DISCOVERY_PATTERN =
+  /\b(doctors?|drs?|availability|available|slots?|time slots?|appointment slots?)\b/i;
+const APPOINTMENT_SLOT_DISCOVERY_PATTERN =
+  /\b(availability|available|slots?|time slots?|appointment slots?)\b/i;
+const LEGACY_AVAILABILITY_REPLY_PATTERNS = [
+  /please\s+(share|tell)\s+.*\bbranch\b.*\bdoctor\b.*\bavailability\b/i,
+  /\bbranch\b.*\bdoctor\s+name\b.*\bcheck\s+availability\b/i,
+  /\bpreferred\s+doctor\b.*\bcheck\s+availability\b/i,
+];
 
 const normalizeMissingKnowledgeTopic = (message = "") =>
   String(message)
@@ -57,10 +117,53 @@ const shouldEnforceStrictGrounding = (message = "", intentResult = null) => {
 
   // Keep booking/appointment and doctor-flow logic unchanged.
   if (intentResult?.intent === "APPOINTMENT_ACTION") return false;
+  if (intentResult?.intent === "MANAGE_APPOINTMENTS_ACTION") return false;
   if (intentResult?.requires?.appointments) return false;
   if (intentResult?.requires?.doctors) return false;
 
   return true;
+};
+
+const shouldUseDoctorListTemplate = (message = "", intentResult = null) => {
+  if (isDoctorListRequest(message)) return true;
+  if (!intentResult || isPureSmallTalkMessage(message)) return false;
+
+  const doctorDiscoveryIntent =
+    intentResult.intent === "APPOINTMENT_ACTION" &&
+    intentResult.requires?.doctors === true &&
+    APPOINTMENT_DISCOVERY_PATTERN.test(message);
+
+  if (!doctorDiscoveryIntent) return false;
+  return (
+    !hasAppointmentStartSignal(message) ||
+    APPOINTMENT_SLOT_DISCOVERY_PATTERN.test(message)
+  );
+};
+
+const isLegacyAvailabilityPrompt = (message = "") =>
+  LEGACY_AVAILABILITY_REPLY_PATTERNS.some((pattern) =>
+    pattern.test(String(message || "")),
+  );
+
+const buildDoctorListTemplateResult = async ({
+  tenant_id,
+  phone,
+  intent = "GENERAL_QUESTION",
+  lead_intelligence = null,
+} = {}) => {
+  const doctorListResult = await buildAvailableDoctorListAppointmentResponse({
+    tenantId: tenant_id,
+    userPhone: phone,
+  });
+  return {
+    message: doctorListResult.message,
+    tagDetected: null,
+    tagPayload: null,
+    intent,
+    requires: { knowledge: false, doctors: true, appointments: false },
+    lead_intelligence,
+    _appointmentResult: doctorListResult,
+  };
 };
 
 const buildForcedMissingKnowledgeResult = (message = "") => ({
@@ -69,18 +172,21 @@ const buildForcedMissingKnowledgeResult = (message = "") => ({
   tagPayload: normalizeMissingKnowledgeTopic(message),
 });
 
+const faqTrace = (label, data) => {
+  const line = `[${new Date().toISOString()}] ${label} ${JSON.stringify(data)}\n`;
+  process.stdout.write(line);
+  try {
+    import("fs").then(fs => fs.default.appendFileSync("/tmp/faq_trace.log", line)).catch(() => {});
+  } catch {}
+};
+
 export const sendWhatsAppMessage = async (tenant_id, to, message) => {
   try {
     if (!message || !message.trim()) return;
 
     const [rows] = await db.sequelize.query(
-      `
-    SELECT phone_number_id, access_token
-    FROM ${tableNames.WHATSAPP_ACCOUNT}
-    WHERE tenant_id = ?
-      AND status IN ('active', 'verified')
-    LIMIT 1
-    `,
+      `SELECT phone_number_id FROM ${tableNames.WHATSAPP_ACCOUNT}
+       WHERE tenant_id = ? AND status IN ('active', 'verified') LIMIT 1`,
       { replacements: [tenant_id] },
     );
 
@@ -88,12 +194,10 @@ export const sendWhatsAppMessage = async (tenant_id, to, message) => {
       throw new Error("No active WhatsApp account for tenant");
     }
 
-    const { phone_number_id, access_token } = rows[0];
+    const { phone_number_id } = rows[0];
+    const access_token = await getSecret(tenant_id, "whatsapp");
+    if (!access_token) throw new Error("WhatsApp access token not found");
 
-    const META_API_VERSION = process.env.META_API_VERSION || "v22.0";
-    console.log(
-      `[SEND-MSG] Using Meta API version: ${META_API_VERSION}, phone_number_id: ${phone_number_id}, to: ${to}`,
-    );
 
     let wamid = null;
     try {
@@ -167,18 +271,166 @@ export const sendWhatsAppMessage = async (tenant_id, to, message) => {
   }
 };
 
+/**
+ * Upload a media file directly to WhatsApp's Media API.
+ * Returns a { mediaId, phone_number_id } — use mediaId for id-based message sends.
+ * This is required for audio (webm/ogg) because link-based sends fail format validation.
+ */
+export const uploadWhatsAppMedia = async (tenant_id, fileBuffer, mimeType, filename) => {
+  const [rows] = await db.sequelize.query(
+    `SELECT phone_number_id, waba_id, tier FROM ${tableNames.WHATSAPP_ACCOUNT}
+     WHERE tenant_id = ? AND status IN ('active', 'verified') LIMIT 1`,
+    { replacements: [tenant_id] },
+  );
+  if (!rows.length) throw new Error("No active WhatsApp account for tenant");
+
+  const account = rows[0];
+  const { phone_number_id } = account;
+  const access_token = await getSecret(tenant_id, "whatsapp");
+  if (!access_token) throw new Error("WhatsApp access token not found");
+
+
+  const form = new FormData();
+  form.append("file", fileBuffer, { filename, contentType: mimeType });
+  form.append("type", mimeType);
+  form.append("messaging_product", "whatsapp");
+
+  try {
+    const resp = await axios.post(
+      `https://graph.facebook.com/${META_API_VERSION}/${phone_number_id}/media`,
+      form,
+      {
+        headers: {
+          Authorization: `Bearer ${access_token}`,
+          ...form.getHeaders(),
+        },
+        httpsAgent,
+        maxContentLength: 20 * 1024 * 1024,
+      },
+    );
+    const mediaId = resp.data?.id;
+    if (!mediaId) throw new Error("WhatsApp media upload returned no id");
+    return { mediaId, phone_number_id };
+  } catch (axiosErr) {
+    if (axiosErr.response) {
+      const metaErr = axiosErr.response.data?.error || {};
+      const metaMsg = metaErr.message || axiosErr.message;
+      const code = metaErr.code ? ` (Code: ${metaErr.code})` : "";
+      throw new Error(`Meta API Error: ${metaMsg}${code}`);
+    }
+    throw axiosErr;
+  }
+};
+
+/**
+ * Send a media message via WhatsApp Cloud API.
+ * Supports both id-based sends (mediaId, preferred for audio) and link-based sends (mediaUrl).
+ *
+ * @param {string} tenant_id
+ * @param {string} to
+ * @param {"image"|"video"|"audio"|"document"} mediaType
+ * @param {string} mediaUrl   - R2 public URL (used for link-based sends)
+ * @param {string} [caption]
+ * @param {string} [filename] - shown in WhatsApp for document type
+ * @param {string|null} [mediaId] - WhatsApp media_id from uploadWhatsAppMedia(); if set, id-based send is used
+ * @returns {Promise<{ phone_number_id: string, wamid: string }>}
+ */
+export const sendWhatsAppMediaMessage = async (
+  tenant_id,
+  to,
+  mediaType,
+  mediaUrl,
+  caption = "",
+  filename = "",
+  mediaId = null,
+) => {
+  try {
+    const [rows] = await db.sequelize.query(
+      `SELECT phone_number_id FROM ${tableNames.WHATSAPP_ACCOUNT}
+       WHERE tenant_id = ? AND status IN ('active', 'verified') LIMIT 1`,
+      { replacements: [tenant_id] },
+    );
+
+    if (!rows.length) throw new Error("No active WhatsApp account for tenant");
+
+    const { phone_number_id } = rows[0];
+    const access_token = await getSecret(tenant_id, "whatsapp");
+    if (!access_token) throw new Error("WhatsApp access token not found");
+
+
+    // id-based send (WhatsApp Media API upload) — reliable for audio/webm
+    // link-based send — works for image/video/document with public R2 URL
+    let mediaPayload;
+    if (mediaId) {
+      if (mediaType === "document") {
+        mediaPayload = { id: mediaId, ...(filename ? { filename } : {}), ...(caption ? { caption } : {}) };
+      } else if (mediaType === "audio") {
+        mediaPayload = { id: mediaId };
+      } else {
+        mediaPayload = { id: mediaId, ...(caption ? { caption } : {}) };
+      }
+    } else {
+      if (mediaType === "image") {
+        mediaPayload = { link: mediaUrl, ...(caption ? { caption } : {}) };
+      } else if (mediaType === "video") {
+        mediaPayload = { link: mediaUrl, ...(caption ? { caption } : {}) };
+      } else if (mediaType === "audio") {
+        mediaPayload = { link: mediaUrl };
+      } else if (mediaType === "document") {
+        mediaPayload = { link: mediaUrl, ...(filename ? { filename } : {}), ...(caption ? { caption } : {}) };
+      } else {
+        throw new Error(`Unsupported media type: ${mediaType}`);
+      }
+    }
+
+    let wamid = null;
+    try {
+      const response = await axios.post(
+        `https://graph.facebook.com/${META_API_VERSION}/${phone_number_id}/messages`,
+        {
+          messaging_product: "whatsapp",
+          to,
+          type: mediaType,
+          [mediaType]: mediaPayload,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${access_token}`,
+            "Content-Type": "application/json",
+          },
+          httpsAgent,
+        },
+      );
+      wamid = response?.data?.messages?.[0]?.id || null;
+    } catch (axiosErr) {
+      if (axiosErr.response) {
+        const metaErr = axiosErr.response.data?.error || {};
+        const metaMsg = metaErr.message || axiosErr.message;
+        const code = metaErr.code ? ` (Code: ${metaErr.code})` : "";
+        throw new Error(`Meta API Error: ${metaMsg}${code}`);
+      }
+      throw axiosErr;
+    }
+
+    return { phone_number_id, wamid };
+  } catch (err) {
+    throw err;
+  }
+};
+
 export const sendWhatsAppLocation = async (tenant_id, to, locationParams) => {
   const [rows] = await db.sequelize.query(
-    `SELECT phone_number_id, access_token FROM ${tableNames.WHATSAPP_ACCOUNT} WHERE tenant_id = ? AND status = 'active' LIMIT 1`,
+    `SELECT phone_number_id FROM ${tableNames.WHATSAPP_ACCOUNT}
+     WHERE tenant_id = ? AND status = 'active' LIMIT 1`,
     { replacements: [tenant_id] },
   );
 
-  if (!rows.length) {
-    throw new Error("No active WhatsApp account for tenant");
-  }
+  if (!rows.length) throw new Error("No active WhatsApp account for tenant");
 
-  const { phone_number_id, access_token } = rows[0];
-  const META_API_VERSION = process.env.META_API_VERSION || "v22.0";
+  const { phone_number_id } = rows[0];
+  const access_token = await getSecret(tenant_id, "whatsapp");
+  if (!access_token) throw new Error("WhatsApp access token not found");
+
 
   const payload = {
     messaging_product: "whatsapp",
@@ -232,24 +484,20 @@ export const sendWhatsAppTemplate = async (
   templateName,
   languageCode,
   components,
+  sendContext = {},
 ) => {
   const [rows] = await db.sequelize.query(
-    `
-    SELECT phone_number_id, access_token
-    FROM ${tableNames.WHATSAPP_ACCOUNT}
-    WHERE tenant_id = ?
-      AND status IN ('active', 'verified')
-    LIMIT 1
-    `,
+    `SELECT phone_number_id, waba_id, tier FROM ${tableNames.WHATSAPP_ACCOUNT}
+     WHERE tenant_id = ? AND status IN ('active', 'verified') LIMIT 1`,
     { replacements: [tenant_id] },
   );
 
-  if (!rows.length) {
-    throw new Error("No active WhatsApp account for tenant");
-  }
+  if (!rows.length) throw new Error("No active WhatsApp account for tenant");
 
-  const { phone_number_id, access_token } = rows[0];
-  console.log("components", JSON.stringify(components, null, 2));
+  const account = rows[0];
+  const { phone_number_id } = account;
+  const access_token = await getSecret(tenant_id, "whatsapp");
+  if (!access_token) throw new Error("WhatsApp access token not found");
 
   // Guard against null/empty language code — default to "en" as safe fallback
   const resolvedLanguageCode = languageCode || "en";
@@ -271,33 +519,73 @@ export const sendWhatsAppTemplate = async (
       components: components || [],
     },
   };
-  console.log("Full Payload:", JSON.stringify(payload, null, 2));
-  const META_API_VERSION = process.env.META_API_VERSION || "v22.0";
-  console.log(
-    `[SEND-TEMPLATE] Using Meta API version: ${META_API_VERSION}, phone_number_id: ${phone_number_id}, to: ${to}`,
-  );
+  const requestUrl = buildMetaMessagesUrl(META_API_VERSION, phone_number_id);
+  console.log("[SEND-TEMPLATE] Meta send request", {
+    campaign_id: sendContext.campaign_id || null,
+    recipient_id: sendContext.recipient_id || null,
+    phone: to,
+    phone_number_id,
+    template_name: templateName,
+    request_url: requestUrl,
+  });
 
+  let limitReservationId = null;
   try {
+    try {
+      limitReservationId = await reserveMetaMessagingRecipient({
+        account,
+        tenantId: tenant_id,
+        recipient: to,
+        templateName,
+      });
+    } catch (limitError) {
+      if (limitError?.code === "LOCAL_META_TIER_LIMIT") throw limitError;
+      console.warn(
+        `[META-LIMIT] Preflight unavailable for tenant ${tenant_id}; Meta remains authoritative: ${limitError.message}`,
+      );
+    }
+
     const response = await axios.post(
-      `https://graph.facebook.com/${META_API_VERSION}/${phone_number_id}/messages`,
+      requestUrl,
       payload,
-      {
-        headers: {
-          Authorization: `Bearer ${access_token}`,
-          "Content-Type": "application/json",
-        },
-        httpsAgent,
-      },
+      buildMetaSendRequestConfig(access_token),
     );
 
     const meta_message_id = response.data?.messages?.[0]?.id;
 
+    try {
+      await confirmMetaMessagingReservation(limitReservationId, meta_message_id);
+    } catch (trackingError) {
+      console.error(
+        `[META-LIMIT] Sent message ${meta_message_id || "without wamid"}, but ledger confirmation failed: ${trackingError.message}`,
+      );
+    }
+
     return { phone_number_id, meta_message_id };
   } catch (error) {
+    try {
+      await releaseMetaMessagingReservation(limitReservationId);
+    } catch (trackingError) {
+      console.warn(
+        `[META-LIMIT] Could not release reservation after failed send: ${trackingError.message}`,
+      );
+    }
+    console.error("[SEND-TEMPLATE] Meta send failed", {
+      campaign_id: sendContext.campaign_id || null,
+      recipient_id: sendContext.recipient_id || null,
+      phone: to,
+      phone_number_id,
+      template_name: templateName,
+      request_url: requestUrl,
+      error_code: error.code || null,
+      error_message: error.message,
+      meta_status: error.response?.status || null,
+      meta_error_body: sanitizeMetaErrorBody(error.response?.data),
+    });
     if (error.response) {
       console.error(
         "Meta API Error Details:",
-        JSON.stringify(error.response.data, null, 2),
+        JSON.stringify(sanitizeMetaErrorBody(error.response.data), null, 2),
       );
       const metaErr = error.response.data?.error || {};
       const message = metaErr.message || error.message;
@@ -305,44 +593,29 @@ export const sendWhatsAppTemplate = async (
       const subcode = metaErr.error_subcode
         ? ` (Subcode: ${metaErr.error_subcode})`
         : "";
-      throw new Error(`Meta API Error: ${message}${code}${subcode}`);
+      const metaError = new Error(`Meta API Error: ${message}${code}${subcode}`);
+      metaError.meta_response_status = error.response.status;
+      metaError.meta_error_code = metaErr.code || null;
+      metaError.meta_error_subcode = metaErr.error_subcode || null;
+      metaError.meta_error_body = sanitizeMetaErrorBody(error.response.data);
+      throw metaError;
     }
     throw error;
   }
 };
 
-export const sendReadReceipt = async (
-  tenant_id,
-  phone_number_id,
-  message_id,
-) => {
+export const sendReadReceipt = async (tenant_id, phone_number_id, message_id) => {
   try {
-    const [rows] = await db.sequelize.query(
-      `
-    SELECT access_token
-    FROM ${tableNames.WHATSAPP_ACCOUNT}
-    WHERE tenant_id = ?
-      AND phone_number_id = ?
-      AND status IN ('active', 'verified')
-    LIMIT 1
-    `,
-      { replacements: [tenant_id, phone_number_id] },
-    );
+    const access_token = await getSecret(tenant_id, "whatsapp");
+    if (!access_token) return;
 
-    if (!rows.length) return;
-
-    const META_API_VERSION = process.env.META_API_VERSION || "v22.0";
     try {
       await axios.post(
         `https://graph.facebook.com/${META_API_VERSION}/${phone_number_id}/messages`,
-        {
-          messaging_product: "whatsapp",
-          status: "read",
-          message_id,
-        },
+        { messaging_product: "whatsapp", status: "read", message_id },
         {
           headers: {
-            Authorization: `Bearer ${rows[0].access_token}`,
+            Authorization: `Bearer ${access_token}`,
             "Content-Type": "application/json",
           },
         },
@@ -354,7 +627,7 @@ export const sendReadReceipt = async (
       );
     }
   } catch (err) {
-    console.error("[READ-RECEIPT] Database Error:", err.message);
+    console.error("[READ-RECEIPT] Error:", err.message);
   }
 };
 
@@ -382,26 +655,12 @@ export const sendTypingIndicator = async (
       console.error("[TYPING] Socket Emit Error:", socketErr.message);
     }
 
-    // 2. Fetch token and send typing indicator to Meta
+    // 2. Fetch token from secrets and send typing indicator to Meta
     if (!message_id) return;
 
-    const [rows] = await db.sequelize.query(
-      `
-    SELECT access_token
-    FROM ${tableNames.WHATSAPP_ACCOUNT}
-    WHERE tenant_id = ?
-      AND phone_number_id = ?
-      AND status IN ('active', 'verified')
-    LIMIT 1
-    `,
-      { replacements: [tenant_id, phone_number_id] },
-    );
-
-    if (!rows.length) return;
-
-    const META_API_VERSION = process.env.META_API_VERSION || "v22.0";
-    const access_token = rows[0]?.access_token;
+    const access_token = await getSecret(tenant_id, "whatsapp");
     if (!access_token) return;
+
 
     try {
       await axios.post(
@@ -465,6 +724,35 @@ export const markMessageProcessed = async (
       { replacements: [tenant_id, phone_number_id, message_id, phone] },
     );
     return result;
+  } catch (err) {
+    throw err;
+  }
+};
+
+export const getProcessedMessageInsertCount = (result, metadata = null) => {
+  const candidates = [result, metadata].flat().filter(Boolean);
+  for (const candidate of candidates) {
+    if (typeof candidate === "number") return candidate;
+    if (typeof candidate?.affectedRows === "number") return candidate.affectedRows;
+    if (typeof candidate?.rowCount === "number") return candidate.rowCount;
+  }
+  return 0;
+};
+
+export const tryMarkMessageProcessed = async (
+  tenant_id,
+  phone_number_id,
+  message_id,
+  phone,
+) => {
+  try {
+    const [result, metadata] = await db.sequelize.query(
+      `INSERT IGNORE INTO ${tableNames.PROCESSEDMESSAGE}
+     (tenant_id, phone_number_id, message_id, phone)
+     VALUES (?, ?, ? , ?)`,
+      { replacements: [tenant_id, phone_number_id, message_id, phone] },
+    );
+    return getProcessedMessageInsertCount(result, metadata) > 0;
   } catch (err) {
     throw err;
   }
@@ -581,12 +869,21 @@ export const getOpenAIReply = async (
   contact_id = null,
   phone_number_id = null,
   cachedData = {},
+  messageId = null,
+  routingContext = {},
 ) => {
   try {
     if (!userMessage) return null;
 
     const cleanMessage = userMessage.trim();
     if (!cleanMessage) return null;
+
+    if (shouldUseDoctorListTemplate(cleanMessage)) {
+      return buildDoctorListTemplateResult({
+        tenant_id,
+        phone,
+      });
+    }
 
     // ── Phase 1: Parallel fetch — language + memory + active prompt (always needed) ──
     const [languageInfo, memory, activePrompt] = await Promise.all([
@@ -610,13 +907,93 @@ export const getOpenAIReply = async (
     console.log("language", languageInfo);
 
     const chatHistory = buildChatHistory(memory);
+    const hasContextualBookingShortcut = isContextualPositiveBookingReply({
+      message: cleanMessage,
+      chatHistory,
+    });
 
     // ── Phase 1.5: Intent Classification — what data does this message need? ──
-    let intentResult = await classifyIntent(
-      cleanMessage,
-      chatHistory,
-      tenant_id,
-    );
+    let intentResult =
+      routingContext?.classifierResult ||
+      routingContext?.intentResult ||
+      (isPureSmallTalkMessage(cleanMessage) && !hasContextualBookingShortcut
+        ? {
+            intent: "GENERAL_QUESTION",
+            requires: { knowledge: false, doctors: false, appointments: false },
+            lead_intelligence: null,
+          }
+        : await classifyIntent(
+            cleanMessage,
+            chatHistory,
+            tenant_id,
+          ));
+    if (hasManageAppointmentStartSignal(cleanMessage)) {
+      intentResult = {
+        ...intentResult,
+        intent: "MANAGE_APPOINTMENTS_ACTION",
+        requires: { knowledge: false, doctors: true, appointments: true },
+      };
+    } else if (hasAppointmentStartSignal(cleanMessage)) {
+      intentResult = {
+        ...intentResult,
+        intent: "APPOINTMENT_ACTION",
+        requires: { knowledge: true, doctors: true, appointments: true },
+      };
+    }
+
+    if (shouldUseDoctorListTemplate(cleanMessage, intentResult)) {
+      return buildDoctorListTemplateResult({
+        tenant_id,
+        phone,
+        intent: intentResult.intent,
+        lead_intelligence: intentResult.lead_intelligence || null,
+      });
+    }
+
+    faqTrace("[AI-FLOW] intent classified", { intent: intentResult.intent, requires: intentResult.requires, msg: cleanMessage.substring(0, 60) });
+
+    const routerMode =
+      routingContext?.routerMode || getAppointmentOperationRouterMode();
+    console.log("[AI FLOW]", "Appointment router mode:", routerMode);
+    if (
+      isAppointmentOperationSafetyEnabled(routerMode) &&
+      (intentResult.intent === "APPOINTMENT_ACTION" ||
+        intentResult.intent === "MANAGE_APPOINTMENTS_ACTION")
+    ) {
+      const route =
+        intentResult.intent === "MANAGE_APPOINTMENTS_ACTION"
+          ? APPOINTMENT_OPERATION_ROUTES.MANAGE_APPOINTMENT
+          : APPOINTMENT_OPERATION_ROUTES.BOOK_APPOINTMENT;
+      const envelope = {
+        shouldHandle: true,
+        route,
+        action: "unknown",
+        source: APPOINTMENT_OPERATION_SOURCES.CLASSIFIER_INTENT,
+        confidence: 0.78,
+        reason: `Normal AI blocked because intent is ${intentResult.intent}.`,
+        entities: {},
+      };
+      console.log(
+        "[AI_APPOINTMENT_BLOCKED]",
+        JSON.stringify({
+          tenantId: tenant_id,
+          phone,
+          message: cleanMessage,
+          intent: intentResult.intent,
+          route,
+          mode: routerMode,
+        }),
+      );
+      return {
+        message: null,
+        tagDetected: null,
+        tagPayload: null,
+        intent: intentResult.intent,
+        requires: intentResult.requires,
+        lead_intelligence: intentResult.lead_intelligence || null,
+        _appointmentRoute: envelope,
+      };
+    }
 
     const factualKnowledgeNeeded = isLikelyFactualQuestion(cleanMessage);
     if (!intentResult.requires.knowledge && factualKnowledgeNeeded) {
@@ -654,15 +1031,18 @@ export const getOpenAIReply = async (
       ? knowledgeResult.chunks.length
       : 0;
 
+    // Also check: did the intent classifier require knowledge, but we found zero chunks?
+    // This is a definitive missing-knowledge signal regardless of factual keyword matching.
+    const knowledgeRequiredButMissing =
+      intentResult.requires.knowledge && !hasKnowledgeGrounding;
+
     console.log(
-      `[WHATSAPP-AI] Grounding precheck | strict:${strictGroundingRequired} | chunks:${groundingChunkCount}`,
+      `[WHATSAPP-AI] Grounding precheck | strict:${strictGroundingRequired} | knowledgeRequiredButMissing:${knowledgeRequiredButMissing} | chunks:${groundingChunkCount}`,
     );
 
-    if (strictGroundingRequired && !hasKnowledgeGrounding) {
+    if ((strictGroundingRequired || knowledgeRequiredButMissing) && !hasKnowledgeGrounding) {
       const forcedMissing = buildForcedMissingKnowledgeResult(cleanMessage);
-      console.warn(
-        `[WHATSAPP-AI] Forced missing-knowledge before AI generation. topic:${forcedMissing.tagPayload}`,
-      );
+      faqTrace("[AI-FLOW] FORCED missing-knowledge (pre-AI)", { tag: forcedMissing.tagDetected, payload: forcedMissing.tagPayload, strict: strictGroundingRequired, knowledgeRequiredButMissing, chunks: groundingChunkCount });
       return {
         ...forcedMissing,
         intent: intentResult.intent,
@@ -693,7 +1073,7 @@ export const getOpenAIReply = async (
       );
       // Use a minimal fallback prompt so AI can still respond
       systemPrompt =
-        "You are a helpful AI assistant. Answer the user's question.";
+        "You are a helpful AI assistant. Answer briefly, never promise a team follow-up, and if information is missing say you do not have that detail right now.";
     }
 
     const aiMessages = [
@@ -743,17 +1123,30 @@ export const getOpenAIReply = async (
         contact_id,
         phone,
         phone_number_id,
+        messageId: messageId || null,
       });
     } catch (procErr) {
       console.error("[WHATSAPP-AI] processResponse failed:", procErr.message);
       processed = { message: rawReply, tagDetected: null, tagPayload: null };
     }
 
-    if (strictGroundingRequired && !hasKnowledgeGrounding) {
+    if ((strictGroundingRequired || knowledgeRequiredButMissing) && !hasKnowledgeGrounding) {
       processed = buildForcedMissingKnowledgeResult(cleanMessage);
-      console.warn(
-        `[WHATSAPP-AI] Forced missing-knowledge after AI generation safety override. topic:${processed.tagPayload}`,
-      );
+      faqTrace("[AI-FLOW] FORCED missing-knowledge (post-AI)", { tag: processed.tagDetected, payload: processed.tagPayload });
+    }
+
+    faqTrace("[AI-FLOW] getOpenAIReply FINAL", { tagDetected: processed.tagDetected, tagPayload: processed.tagPayload, msgPreview: (processed.message || "").substring(0, 60) });
+
+    if (isLegacyAvailabilityPrompt(processed.message)) {
+      faqTrace("[AI-FLOW] blocked legacy availability prompt", {
+        msgPreview: String(processed.message || "").substring(0, 80),
+      });
+      return buildDoctorListTemplateResult({
+        tenant_id,
+        phone,
+        intent: intentResult.intent,
+        lead_intelligence: intentResult.lead_intelligence || null,
+      });
     }
 
     const finalReply = processed.message;
@@ -765,9 +1158,95 @@ export const getOpenAIReply = async (
       tagDetected: processed.tagDetected,
       tagPayload: processed.tagPayload,
       intent: intentResult.intent,
+      requires: intentResult.requires,
+      lead_intelligence: intentResult.lead_intelligence || null,
     };
   } catch (err) {
     console.error("OpenAI error:", err.message);
-    return { message: null, tagDetected: null, tagPayload: null };
+    return {
+      message: null,
+      tagDetected: null,
+      tagPayload: null,
+      intent: null,
+      requires: null,
+      lead_intelligence: null,
+    };
+  }
+};
+
+/**
+ * Vision-aware AI reply for incoming user images.
+ *
+ * Skips intent classification, knowledge search, and FAQ pipeline — those are
+ * text-only paths. Vision reply is a direct GPT-4o call with:
+ *   - The tenant system prompt (business context + persona)
+ *   - Last 30 conversation messages as text context
+ *   - The image + user caption as the final user turn
+ *
+ * @param {string} tenant_id
+ * @param {string} phone          - User's phone number (for memory lookup)
+ * @param {string} imageUrl       - Public R2 URL of the image
+ * @param {string} caption        - User's caption typed alongside the image (may be empty)
+ * @param {string} contact_id
+ * @param {string} phone_number_id
+ * @param {object} cachedData     - Pre-fetched tenant/contact/lead data
+ * @returns {Promise<{ message: string|null }>}
+ */
+export const getOpenAIVisionReply = async (
+  tenant_id,
+  phone,
+  imageUrl,
+  caption = "",
+  contact_id = null,
+  phone_number_id = null,
+  cachedData = {},
+) => {
+  try {
+    const { analyzeImageAndReply } = await import("../../utils/ai/visionAi.js");
+
+    // Fetch conversation memory and active prompt in parallel
+    const [memory, activePrompt] = await Promise.all([
+      getConversationMemory(tenant_id, phone, contact_id).catch((err) => {
+        console.error("[VISION-AI] Memory fetch failed:", err.message);
+        return [];
+      }),
+      getActivePromptService(tenant_id).catch((err) => {
+        console.error("[VISION-AI] Active prompt fetch failed:", err.message);
+        return null;
+      }),
+    ]);
+
+    const chatHistory = buildChatHistory(memory);
+
+    // Build system prompt (business context, persona, language settings)
+    let systemPrompt = "";
+    try {
+      const promptResult = await buildAiSystemPrompt(
+        tenant_id,
+        contact_id,
+        { language: "unknown", style: "unknown", label: "unknown" },
+        caption || "image",
+        { ...cachedData, activePrompt, knowledgeResult: { chunks: [], resolvedLogs: [], sources: [] } },
+      );
+      systemPrompt = promptResult.systemPrompt;
+    } catch (err) {
+      console.error("[VISION-AI] System prompt build failed:", err.message);
+      systemPrompt =
+        "You are a helpful AI assistant. Analyze the image the user sent and respond helpfully based on the conversation context.";
+    }
+
+    const reply = await analyzeImageAndReply({
+      imageUrl,
+      caption,
+      history: chatHistory,
+      systemPrompt,
+      tenantId: tenant_id,
+    });
+
+    console.log("[VISION-AI] Reply generated:", reply?.substring(0, 120));
+    return { message: reply || null };
+  } catch (err) {
+    console.error("[VISION-AI] getOpenAIVisionReply failed:", err.message);
+    return { message: null };
   }
 };

@@ -1,4 +1,4 @@
-import { tableNames } from "../../database/tableName.js";
+﻿import { tableNames } from "../../database/tableName.js";
 import {
   generateAccessToken,
   generateInviteToken,
@@ -16,6 +16,10 @@ import {
   updateTenantService,
 } from "../TenantModel/tenant.service.js";
 import {
+  getUserPreferencesService,
+  upsertUserPreferencesService,
+} from "../UserPreferencesModel/userPreferences.service.js";
+import {
   createTenantUserService,
   findTenantUserByIdService,
   getAllTenantUsersService,
@@ -28,7 +32,14 @@ import {
   getDeletedTenantUserListService,
   restoreTenantUserService,
   findTenantUserByIdIgnoringDeleteService,
+  countActiveTenantUsersService,
+  updateTenantPasswordService,
 } from "./tenantuser.service.js";
+import {
+  generateOTPService,
+  verifyOTPService,
+  checkOTPVerificationService,
+} from "../OtpVerificationModel/otpverification.service.js";
 import bcrypt from "bcrypt";
 import { generatePassword } from "../../utils/helpers/generatePassword.js";
 import crypto from "crypto";
@@ -53,6 +64,8 @@ export const getLoggedTenantUserController = async (req, res) => {
       return res.status(404).json({ message: "User profile not found" });
     }
 
+    const userPrefs = await getUserPreferencesService(unique_id, "tenant");
+
     // Remove sensitive data
     delete user.password_hash;
 
@@ -75,9 +88,64 @@ export const getLoggedTenantUserController = async (req, res) => {
       user.webhook_verified = !!tenant.webhook_verified;
     }
 
+    user.preferences = { theme: userPrefs?.theme || "light" };
+
     return res.status(200).json({
       message: "Profile fetched successfully",
       data: { ...user, user_type: "tenant" },
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+export const getLoggedTenantUserPreferencesController = async (req, res) => {
+  try {
+    const { unique_id } = req.user;
+
+    if (!unique_id) {
+      return res
+        .status(400)
+        .json({ message: "Tenant user ID not found in session" });
+    }
+
+    const userPrefs = await getUserPreferencesService(unique_id, "tenant");
+
+    return res.status(200).json({
+      message: "User preferences fetched successfully",
+      data: {
+        theme: userPrefs?.theme || "light",
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+export const updateLoggedTenantUserPreferencesController = async (req, res) => {
+  try {
+    const { unique_id, tenant_id } = req.user;
+    const { preferences } = req.body;
+
+    if (!unique_id) {
+      return res
+        .status(400)
+        .json({ message: "Tenant user ID not found in session" });
+    }
+
+    if (!preferences || typeof preferences !== "object") {
+      return res.status(400).json({ message: "Preferences payload is required" });
+    }
+
+    await upsertUserPreferencesService(unique_id, tenant_id, preferences, "tenant");
+
+    const updatedPrefs = await getUserPreferencesService(unique_id, "tenant");
+
+    return res.status(200).json({
+      message: "User preferences updated successfully",
+      data: {
+        theme: updatedPrefs?.theme || "light",
+      },
     });
   } catch (err) {
     return res.status(500).json({ message: err.message });
@@ -180,7 +248,7 @@ export const updateLoggedTenantOrganizationController = async (req, res) => {
 export const updateLoggedTenantProfileController = async (req, res) => {
   try {
     const { unique_id, tenant_id, role } = req.user;
-    const { username, country_code, mobile, organization } = req.body;
+    const { username, country_code, mobile, organization, preferences } = req.body;
 
     if (!unique_id) {
       return res.status(400).json({ message: "User ID not found in session" });
@@ -199,6 +267,10 @@ export const updateLoggedTenantProfileController = async (req, res) => {
 
     if (Object.keys(profileData).length > 0) {
       await updateTenantUserByIdService(unique_id, profileData);
+    }
+
+    if (preferences && typeof preferences === "object") {
+      await upsertUserPreferencesService(unique_id, tenant_id, preferences, "tenant");
     }
 
     // Update organization fields — only tenant_admin allowed
@@ -260,6 +332,9 @@ export const updateLoggedTenantProfileController = async (req, res) => {
       }
     }
 
+    const updatedPrefs = await getUserPreferencesService(unique_id, "tenant");
+    if (updatedUser) updatedUser.preferences = { theme: updatedPrefs?.theme || "light" };
+
     return res.status(200).json({
       message: "Profile updated successfully",
       data: { ...updatedUser, user_type: "tenant" },
@@ -272,6 +347,7 @@ export const updateLoggedTenantProfileController = async (req, res) => {
 export const createTenantUserController = async (req, res) => {
   const { title, username, email, country_code, mobile, profile, role } =
     req.body;
+  const allowedRoles = new Set(["tenant_admin", "staff"]);
 
   const tenant_id = req.user.tenant_id;
   const loginuser = req.user;
@@ -298,6 +374,12 @@ export const createTenantUserController = async (req, res) => {
     });
   }
 
+  if (!allowedRoles.has(role)) {
+    return res.status(400).send({
+      message: "Invalid role. Allowed roles are tenant_admin and staff.",
+    });
+  }
+
   const trimmedEmail = email?.trim()?.toLowerCase();
 
   const existingUserGlobally =
@@ -313,6 +395,15 @@ export const createTenantUserController = async (req, res) => {
   if (!getloginuserDetails) {
     return res.status(400).send({
       message: "Tenant details required",
+    });
+  }
+
+  // Enforce max_users limit
+  const maxUsers = getloginuserDetails.max_users ?? 10;
+  const currentUserCount = await countActiveTenantUsersService(tenant_id);
+  if (currentUserCount >= maxUsers) {
+    return res.status(400).send({
+      message: `User limit reached. Your plan allows a maximum of ${maxUsers} users. Please upgrade your plan to add more users.`,
     });
   }
 
@@ -448,6 +539,12 @@ export const loginTenantUserController = async (req, res) => {
 
     const userDetails = { ...user, user_type: "tenant" };
     delete userDetails.password_hash;
+
+    const userPrefs = await getUserPreferencesService(
+      user.tenant_user_id,
+      "tenant",
+    );
+    userDetails.preferences = { theme: userPrefs?.theme || "light" };
 
     // Fetch tenant details for company name and webhook status
     const tenant = await findTenantByIdService(user.tenant_id);
@@ -682,13 +779,6 @@ export const restoreTenantUserController = async (req, res) => {
 };
 
 // --- Password Reset Controllers ---
-
-import {
-  generateOTPService,
-  verifyOTPService,
-  checkOTPVerificationService,
-} from "../OtpVerificationModel/otpverification.service.js";
-import { updateTenantPasswordService } from "./tenantuser.service.js";
 
 export const forgotTenantPasswordController = async (req, res) => {
   try {

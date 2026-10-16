@@ -22,6 +22,7 @@ import {
   DEFAULT_USD_TO_INR,
   DEFAULT_MARKUP_PERCENT,
 } from "../config/billing.config.js";
+import { reviewedCachedRate } from "../config/aiCachedInputPricing.js";
 
 // ============================================================
 // META WHATSAPP TEMPLATE PRICING (Per Conversation - USD)
@@ -554,31 +555,27 @@ const seedAiModelPricing = async () => {
 
   for (const model of AI_MODEL_PRICING) {
     try {
+      const reviewed = reviewedCachedRate(model.model);
+      const pricing = {
+        ...model,
+        cached_input_price_per_million:
+          reviewed.known && reviewed.verified ? reviewed.rate : null,
+        // New models require catalog review and activation, even with known rates.
+        is_active: false,
+      };
       const existing = await db.AiPricing.findOne({
         where: { model: model.model },
       });
 
       if (!existing) {
-        await db.AiPricing.create(model);
+        await db.AiPricing.create(pricing);
         console.log(
           `  âœ… Added: ${model.model.padEnd(20)} | ${model.category.padEnd(9)} | Input: $${model.input_rate.toFixed(2)}/M | Output: $${model.output_rate.toFixed(2)}/M`,
         );
         added++;
       } else {
-        // Update existing record to ensure markup is 10% and rates are current
-        await existing.update({
-          description: model.description,
-          recommended_for: model.recommended_for,
-          category: model.category,
-          input_rate: model.input_rate,
-          output_rate: model.output_rate,
-          markup_percent: DEFAULT_MARKUP_PERCENT,
-          usd_to_inr_rate: model.usd_to_inr_rate,
-          is_active: model.is_active,
-        });
-        console.log(
-          `  ðŸ”„ Updated: ${model.model.padEnd(20)} | ${model.category.padEnd(9)} | Input: $${model.input_rate.toFixed(2)}/M | Output: $${model.output_rate.toFixed(2)}/M`,
-        );
+        // Existing prices and activation are owned by the audited admin workflow.
+        console.log(`  Skipped existing AI pricing: ${model.model}`);
         skipped++;
       }
     } catch (error) {
@@ -586,7 +583,7 @@ const seedAiModelPricing = async () => {
     }
   }
 
-  console.log(`\n  ðŸ“Š AI Model Summary: ${added} added, ${skipped} updated`);
+  console.log(`\n  AI Model Summary: ${added} added inactive, ${skipped} preserved`);
 };
 
 // ============================================================
@@ -622,10 +619,10 @@ const seedAllPricing = async () => {
     );
     console.log("\nðŸ“ Notes:");
     console.log(
-      "   \u2022 All markup_percent values are set to 10 (10% platform markup)",
+      "   New AI pricing uses seed defaults; existing AI pricing is preserved",
     );
     console.log("   â€¢ Super Admin can adjust markup via dashboard later");
-    console.log("   • USD to INR rate is set to 93.0 for AI models");
+    console.log("   Review all three AI rates before catalog activation");
     console.log("\n");
 
     process.exit(0);

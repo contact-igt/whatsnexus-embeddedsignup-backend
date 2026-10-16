@@ -5,12 +5,20 @@ import {
   testWhatsappAccountController,
   activateWhatsappAccountController,
   updateAccessTokenController,
+  updateWhatsappAccountController,
   getWhatsappAccountController,
   getTierLimitController,
   softDeleteWhatsappAccountController,
   permanentDeleteWhatsappAccountController,
   subscribeToWebhooksController,
 } from "./whatsappAccount.controller.js";
+
+import {
+  getOnboardingConfigController,
+  startEmbeddedSignupController,
+  completeEmbeddedSignupController,
+  resumeEmbeddedSignupController,
+} from "./whatsappEmbeddedSignup.controller.js";
 
 import {
   authenticate,
@@ -33,7 +41,7 @@ router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   getWhatsappAccountController,
 );
@@ -43,7 +51,7 @@ router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   getTierLimitController,
 );
@@ -53,6 +61,13 @@ router.post(
   authenticate,
   authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
   testWhatsappAccountController,
+);
+
+router.put(
+  "/whatsapp-account",
+  authenticate,
+  authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
+  updateWhatsappAccountController,
 );
 
 router.put(
@@ -89,6 +104,35 @@ router.post(
   authenticate,
   authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
   subscribeToWebhooksController,
+);
+
+// ── Meta Embedded Signup (additive; every route re-checks org flags server-side) ──
+router.get(
+  "/whatsapp-account/onboarding-config",
+  authenticate,
+  authorize({ user_type: "tenant", roles: ["tenant_admin", "staff"] }),
+  getOnboardingConfigController,
+);
+
+router.post(
+  "/whatsapp-account/embedded-signup/start",
+  authenticate,
+  authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
+  startEmbeddedSignupController,
+);
+
+router.post(
+  "/whatsapp-account/embedded-signup/complete",
+  authenticate,
+  authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
+  completeEmbeddedSignupController,
+);
+
+router.post(
+  "/whatsapp-account/embedded-signup/resume",
+  authenticate,
+  authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
+  resumeEmbeddedSignupController,
 );
 
 export default router;

@@ -1,16 +1,18 @@
 import express from "express";
 import {
-  deleteLeadController,
-  permanentDeleteLeadController,
   getLeadListController,
   getLeadSummaryController,
   updateLeadController,
-  getDeletedLeadListController,
-  restoreLeadController,
   getBulkLeadSummaryController,
   getLeadByIdController,
   bulkUpdateLeadsController,
 } from "./leads.controller.js";
+import {
+  softDeleteLeadController,
+  hardDeleteLeadController,
+  restoreLeadController,
+  getDeletedLeadsController,
+} from "./leads.lifecycle.js";
 import {
   authenticate,
   authorize,
@@ -18,8 +20,7 @@ import {
 import { requireAiAccess } from "../../middlewares/billing/billingAccessGuard.js";
 
 const Router = express.Router();
-
-const tenantRoles = ["tenant_admin", "doctor", "staff", "agent"];
+const tenantRoles = ["tenant_admin", "staff"];
 
 Router.get(
   "/leads",
@@ -69,14 +70,14 @@ Router.delete(
   "/lead/:lead_id/soft",
   authenticate,
   authorize({ user_type: "tenant", roles: tenantRoles }),
-  deleteLeadController,
+  softDeleteLeadController,
 );
 
 Router.get(
   "/leads/deleted/list",
   authenticate,
   authorize({ user_type: "tenant", roles: tenantRoles }),
-  getDeletedLeadListController,
+  getDeletedLeadsController,
 );
 
 Router.post(
@@ -90,7 +91,7 @@ Router.delete(
   "/lead/:lead_id/permanent",
   authenticate,
   authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
-  permanentDeleteLeadController,
+  hardDeleteLeadController,
 );
 
 export default Router;

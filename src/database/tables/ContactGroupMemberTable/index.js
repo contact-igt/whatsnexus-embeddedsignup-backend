@@ -36,6 +36,7 @@ export const ContactGroupMemberTable = (sequelize, Sequelize) => {
             updatedAt: {
                 type: Sequelize.DATE,
                 allowNull: false,
+                defaultValue: sequelize.literal("CURRENT_TIMESTAMP"),
                 field: "updated_at",
             },
         },
@@ -57,5 +58,4 @@ export const ContactGroupMemberTable = (sequelize, Sequelize) => {
         },
     );
 };
-
 

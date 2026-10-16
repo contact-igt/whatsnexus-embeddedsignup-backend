@@ -140,7 +140,7 @@ Router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "doctor", "staff", "agent"],
+    roles: ["tenant_admin" , "staff"],
   }),
   getTenantWebhookStatusController,
 );
@@ -150,7 +150,7 @@ Router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "staff", "doctor", "agent"],
+    roles: ["tenant_admin", "staff" , ],
   }),
   getTenantSettingsController,
 );
@@ -171,7 +171,7 @@ Router.get(
   authenticate,
   authorize({
     user_type: "tenant",
-    roles: ["tenant_admin", "staff", "doctor", "agent"],
+    roles: ["tenant_admin", "staff" , ],
   }),
   getAvailableTimezonesController,
 );

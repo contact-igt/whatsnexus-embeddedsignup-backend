@@ -43,8 +43,26 @@ export const TenantsTable = (sequelize, Sequelize) => {
       },
 
       type: {
-        type: Sequelize.ENUM("hospital", "clinic", "organization"),
+        type: Sequelize.ENUM("hospital", "clinic", "organization", "education", "law"),
         allowNull: false,
+      },
+
+      industry_type: {
+        type: Sequelize.ENUM("healthcare", "education", "general"),
+        allowNull: false,
+        defaultValue: "general",
+      },
+
+      industry_id: {
+        type: Sequelize.STRING,
+        allowNull: true,
+        defaultValue: null,
+      },
+
+      plan_id: {
+        type: Sequelize.STRING,
+        allowNull: true,
+        defaultValue: null,
       },
 
       address: {
@@ -201,15 +219,20 @@ export const TenantsTable = (sequelize, Sequelize) => {
       ai_settings: {
         type: Sequelize.JSON,
         allowNull: true,
-        defaultValue: {
-          auto_responder: true,
-          smart_reply: true,
-          neural_summary: true,
-          content_generation: true,
-          input_model: "gpt-4o-mini",
-          output_model: "gpt-4o",
-          openai_api_key: "",
-        },
+      },
+
+      // WhatsApp onboarding capabilities (Super Admin controlled). Default OFF so
+      // existing organizations keep the manual-only WhatsApp Settings experience.
+      embedded_signup_enabled: {
+        type: Sequelize.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
+
+      coexistence_enabled: {
+        type: Sequelize.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
       },
 
       createdAt: {
@@ -253,6 +276,14 @@ export const TenantsTable = (sequelize, Sequelize) => {
           name: "unique_owner_mobile",
           unique: true,
           fields: ["owner_mobile"],
+        },
+        {
+          name: "idx_tenant_industry_id",
+          fields: ["industry_id"],
+        },
+        {
+          name: "idx_tenant_plan_id",
+          fields: ["plan_id"],
         },
       ],
     },

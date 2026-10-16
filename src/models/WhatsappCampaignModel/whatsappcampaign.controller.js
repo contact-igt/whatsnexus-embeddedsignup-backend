@@ -2,16 +2,29 @@ import {
   createCampaignService,
   getCampaignListService,
   getCampaignByIdService,
+  exportCampaignRecipientsCsvService,
   executeCampaignBatchService,
   softDeleteCampaignService,
   permanentDeleteCampaignService,
   getDeletedCampaignListService,
   restoreCampaignService,
+  updateCampaignStatusService,
+  retryCampaignRecipientsService,
+  recordCampaignEventService,
+  getCampaignStatsService,
+  resolveRecipientCount,
 } from "./whatsappcampaign.service.js";
 import { missingFieldsChecker } from "../../utils/helpers/missingFields.js";
-import { uploadToCloudinary } from "../../middlewares/cloudinary/cloudinaryUpload.js";
 import { checkBillingAccess } from "../../middlewares/billing/billingAccessGuard.js";
 import { estimateMetaCost } from "../../utils/billing/costEstimator.js";
+import { uploadMediaService } from "../GalleryModel/gallery.service.js";
+import { getWhatsappAccountByTenantService } from "../WhatsappAccountModel/whatsappAccount.service.js";
+import { hasSecret } from "../TenantSecretsModel/tenantSecrets.service.js";
+import { getCampaignDiagnosticsService } from "../../services/campaignDiagnostics.service.js";
+import {
+  isCampaignQueueAvailable,
+  getCampaignDispatchQueue,
+} from "../../queues/campaignQueue.js";
 
 /**
  * GET /whatsapp-campaign/estimate-cost
@@ -39,33 +52,27 @@ export const estimateCampaignCostController = async (req, res) => {
       attributes: ["country", "owner_country_code", "timezone"],
       raw: true,
     });
-    
+
     // Auto-detect India based on timezone or country code
-    const isIndia = (tenant?.owner_country_code === "91" || tenant?.timezone === "Asia/Kolkata");
-    const country = req.body.country || tenant?.country || (isIndia ? "IN" : "Global");
+    const isIndia =
+      tenant?.owner_country_code === "91" ||
+      tenant?.timezone === "Asia/Kolkata";
+    const country =
+      req.body.country || tenant?.country || (isIndia ? "IN" : "Global");
 
     // Get cost per message
     const cost = await estimateMetaCost(category, country);
     const perMessageCostInr = cost.totalCostInr;
     const totalCostInr = perMessageCostInr * recipientCount;
 
-    // Get wallet balance for comparison
-    const wallet = await db.Wallets.findOne({
-      where: { tenant_id },
-      attributes: ["balance"],
-      raw: true,
-    });
-    const walletBalance = wallet ? parseFloat(wallet.balance) || 0 : 0;
+    const access = await checkBillingAccess(tenant_id, totalCostInr);
 
     return res.status(200).json({
       success: true,
       category,
       recipient_count: recipientCount,
       per_message_cost_inr: perMessageCostInr,
-      total_cost_inr: totalCostInr,
-      wallet_balance: walletBalance,
-      is_sufficient: walletBalance >= totalCostInr,
-      shortfall: Math.max(0, totalCostInr - walletBalance),
+      ...access,
       base_rate_usd: cost.baseRate,
       markup_percent: cost.markupPercent,
       conversion_rate: cost.conversionRate,
@@ -77,8 +84,6 @@ export const estimateCampaignCostController = async (req, res) => {
 };
 
 // ... existing code ...
-
-
 
 export const getDeletedCampaignListController = async (req, res) => {
   const tenant_id = req.user.tenant_id;
@@ -141,27 +146,45 @@ export const createCampaignController = async (req, res) => {
       });
     }
 
+    // Verify WhatsApp access token exists before allowing campaign creation
+    const hasWhatsAppToken = await hasSecret(tenant_id, "whatsapp");
+    if (!hasWhatsAppToken) {
+      console.error(
+        `[CAMPAIGN-CREATE] WhatsApp access token not found for tenant ${tenant_id}`,
+      );
+      return res.status(400).send({
+        success: false,
+        message:
+          "WhatsApp is not configured. Please complete WhatsApp setup in Settings before creating campaigns.",
+      });
+    }
+
     // Validate scheduled_at is in the future (at least 1 minute ahead)
     if (campaign_type === "scheduled" && req.body.scheduled_at) {
       const scheduledTime = new Date(req.body.scheduled_at);
       const now = new Date();
       if (isNaN(scheduledTime.getTime())) {
-        return res.status(400).send({ message: "Invalid scheduled_at date format" });
+        return res
+          .status(400)
+          .send({ message: "Invalid scheduled_at date format" });
       }
       if (scheduledTime.getTime() <= now.getTime() + 60_000) {
         return res.status(400).send({
           message: "Scheduled time must be at least 1 minute in the future",
         });
       }
+      req.body.scheduled_at = scheduledTime.toISOString();
     }
 
     // Billing check: wallet must cover the estimated total cost for ALL campaign types,
     // including scheduled. If wallet is insufficient at creation time, block the campaign.
     // At scheduled execution time the wallet is checked again per-batch — if it has
     // dropped below cost by then, the campaign will be automatically paused.
-    const recipientCount = Array.isArray(audience_data)
-      ? audience_data.length
-      : 1;
+    const recipientCount = await resolveRecipientCount(
+      tenant_id,
+      audience_type,
+      audience_data,
+    );
     if (recipientCount > 0) {
       try {
         // Get template category for cost estimation
@@ -172,16 +195,19 @@ export const createCampaignController = async (req, res) => {
           raw: true,
         });
         const category = (template?.category || "marketing").toLowerCase();
-        
+
         // Look up tenant's country and timezone
         const tenant = await db.Tenants.findOne({
           where: { tenant_id },
           attributes: ["country", "owner_country_code", "timezone"],
           raw: true,
         });
-        const isIndia = (tenant?.owner_country_code === "91" || tenant?.timezone === "Asia/Kolkata");
-        const country = req.body.country || tenant?.country || (isIndia ? "IN" : "Global");
-        
+        const isIndia =
+          tenant?.owner_country_code === "91" ||
+          tenant?.timezone === "Asia/Kolkata";
+        const country =
+          req.body.country || tenant?.country || (isIndia ? "IN" : "Global");
+
         const cost = await estimateMetaCost(category, country);
         const estimated_cost = cost.totalCostInr * recipientCount;
 
@@ -200,7 +226,13 @@ export const createCampaignController = async (req, res) => {
           "[CAMPAIGN-CREATE] Billing check error:",
           billingErr.message,
         );
-        // Fail open on billing check error — don't block campaign creation
+        return res.status(503).json({
+          success: false,
+          blocked: true,
+          blocked_reason:
+            "Billing validation is temporarily unavailable. Please try again.",
+          message: "Billing validation is temporarily unavailable. Please try again.",
+        });
       }
     }
 
@@ -210,144 +242,174 @@ export const createCampaignController = async (req, res) => {
       created_by,
     );
 
-    // For immediate send campaigns (not scheduled), trigger execution right away
-    if (campaign_type !== "scheduled") {
-      // Fire and forget - don't block the response
-      setImmediate(async () => {
-        try {
-          // Execute all batches until complete
-          let finished = false;
-          while (!finished) {
-            const result = await executeCampaignBatchService(
-              campaign.campaign_id,
-              tenant_id,
-              100,
-            );
-            finished = result.finished;
-          }
-        } catch (err) {
-          console.error(
-            `[Campaign Immediate Exec] Error for campaign ${campaign.campaign_id}:`,
-            err.message,
-          );
-        }
-      });
-    }
-
-    return res.status(200).send({
+    return res.status(201).json({
+      success: true,
       message: "Campaign created successfully",
       campaign,
     });
   } catch (err) {
-    return res.status(500).send({ message: err.message });
+    console.error("[CAMPAIGN-CREATE] Error:", err.message);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to create campaign",
+    });
   }
 };
 
 export const getCampaignListController = async (req, res) => {
-  const tenant_id = req.user.tenant_id;
   try {
-    const data = await getCampaignListService(tenant_id, req.query);
-    return res.status(200).send({
-      message: "Success",
-      data,
-    });
+    const result = await getCampaignListService(req.user.tenant_id, req.query);
+    return res.status(200).json({ success: true, data: result });
   } catch (err) {
-    return res.status(500).send({ message: err.message });
+    return res.status(500).json({ success: false, message: err.message });
   }
 };
 
 export const getCampaignByIdController = async (req, res) => {
-  const { campaign_id } = req.params;
-  const tenant_id = req.user.tenant_id;
   try {
     const campaign = await getCampaignByIdService(
-      campaign_id,
-      tenant_id,
+      req.params.campaign_id,
+      req.user.tenant_id,
       req.query,
     );
     if (!campaign) {
-      return res.status(404).send({ message: "Campaign not found" });
+      return res.status(404).json({ success: false, message: "Campaign not found" });
     }
-    return res.status(200).send({
-      message: "Success",
-      data: campaign,
-    });
+    return res.status(200).json({ success: true, data: campaign });
   } catch (err) {
-    return res.status(500).send({ message: err.message });
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+export const exportCampaignRecipientsCsvController = async (req, res) => {
+  try {
+    const result = await exportCampaignRecipientsCsvService(
+      req.params.campaign_id,
+      req.user.tenant_id,
+      req.query?.recipient_status,
+    );
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${result.fileName}"`,
+    );
+    return res.status(200).send(result.csv);
+  } catch (err) {
+    const status = err.message === "Campaign not found" ? 404 : 500;
+    return res.status(status).json({ success: false, message: err.message });
   }
 };
 
 export const triggerCampaignExecutionController = async (req, res) => {
-  const { campaign_id } = req.params;
-  const tenant_id = req.user.tenant_id;
   try {
-    const result = await executeCampaignBatchService(campaign_id, tenant_id);
-    return res.status(200).send({
-      message: result.finished
-        ? "Campaign already completed"
-        : "Batch execution started",
-      result,
+    const result = await executeCampaignBatchService(
+      req.params.campaign_id,
+      req.user.tenant_id,
+    );
+    return res.status(200).json({ success: true, data: result });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+export const updateCampaignStatusController = async (req, res) => {
+  try {
+    const status = req.body?.status || req.query?.status;
+    if (!status) {
+      return res.status(400).json({ success: false, message: "status is required" });
+    }
+    const result = await updateCampaignStatusService(
+      req.user.tenant_id,
+      req.params.campaign_id,
+      status,
+    );
+    return res.status(200).json({ success: true, data: result });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({
+      success: false,
+      message: err.message,
+      ...(err.billingAccess || {}),
     });
-  } catch (err) {
-    return res.status(500).send({ message: err.message });
   }
 };
 
-export const softDeleteCampaignController = async (req, res) => {
-  const { campaign_id } = req.params;
-  const tenant_id = req.user.tenant_id;
+export const retryCampaignRecipientsController = async (req, res) => {
   try {
-    const result = await softDeleteCampaignService(campaign_id, tenant_id);
-    return res.status(200).send(result);
+    const result = await retryCampaignRecipientsService(
+      req.user.tenant_id,
+      req.body || {},
+    );
+    return res.status(200).json({ success: true, data: result });
   } catch (err) {
-    if (err.message === "Campaign not found") {
-      return res.status(404).send({ message: err.message });
-    }
-    return res.status(500).send({ message: err.message });
+    return res.status(err.statusCode || 500).json({
+      success: false,
+      message: err.message,
+      ...(err.missingRecipientIds
+        ? { missing_recipient_ids: err.missingRecipientIds }
+        : {}),
+    });
   }
 };
 
-export const permanentDeleteCampaignController = async (req, res) => {
-  const { campaign_id } = req.params;
-  const tenant_id = req.user.tenant_id;
+export const campaignEventWebhookController = async (req, res) => {
   try {
-    const result = await permanentDeleteCampaignService(campaign_id, tenant_id);
-    return res.status(200).send(result);
+    const result = await recordCampaignEventService(req.body || {});
+    return res.status(200).json({ success: true, data: result });
   } catch (err) {
-    if (err.message === "Campaign not found") {
-      return res.status(404).send({ message: err.message });
-    }
-    return res.status(500).send({ message: err.message });
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+export const getCampaignStatsController = async (req, res) => {
+  try {
+    const result = await getCampaignStatsService(
+      req.user.tenant_id,
+      req.params.campaign_id,
+    );
+    return res.status(200).json({ success: true, data: result });
+  } catch (err) {
+    const status = err.message === "Campaign not found" ? 404 : 500;
+    return res.status(status).json({ success: false, message: err.message });
   }
 };
 
 export const uploadCampaignMediaController = async (req, res) => {
   try {
-    if (!req.files || !req.files.media) {
-      return res.status(400).send({ message: "No media file uploaded" });
+    const file = req.files?.file || req.file;
+    if (!file) {
+      return res.status(400).json({ success: false, message: "file is required" });
     }
 
-    const file = req.files.media;
-    const type = req.body.type || "image"; // image, video, document
+    const account = await getWhatsappAccountByTenantService(req.user.tenant_id);
+    const accessToken = account?.access_token;
+    const appId = account?.app_id || process.env.META_APP_ID;
+    if (!accessToken || !appId) {
+      return res.status(400).json({
+        success: false,
+        message: "WhatsApp access token or Meta app id is missing",
+      });
+    }
 
-    // Resource type for Cloudinary
-    let resourceType = "image";
-    if (type === "video") resourceType = "video";
-    if (type === "document") resourceType = "raw";
-
-    const imageUrl = await uploadToCloudinary(
+    const media = await uploadMediaService(
       file,
-      resourceType,
-      "public",
-      "campaigns",
+      req.user.tenant_id,
+      req.user.unique_id || "system",
+      accessToken,
+      appId,
+      { folder: "campaigns" },
     );
 
-    return res.status(200).send({
-      message: "Media uploaded successfully",
-      url: imageUrl,
-    });
+    return res.status(201).json({ success: true, data: media });
   } catch (err) {
-    console.error("Upload error:", err);
-    return res.status(500).send({ message: err.message });
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+export const getCampaignDiagnosticsController = async (_req, res) => {
+  try {
+    const result = await getCampaignDiagnosticsService();
+    return res.status(200).json({ success: true, data: result });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
   }
 };

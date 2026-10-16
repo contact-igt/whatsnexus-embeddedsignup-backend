@@ -1,17 +1,23 @@
+import { invalidateModelAccess } from "./modelAccess.js";
 import OpenAI from "openai";
+import { getSecret } from "../../models/TenantSecretsModel/tenantSecrets.service.js";
 import db from "../../database/index.js";
 import { decrypt } from "../encryption.js";
 
-// Cache decrypted tenant API keys for 5 minutes
+// Cache resolved tenant keys for 5 minutes to avoid repeated DB + decrypt round-trips.
+// Resolved secrets are held only in this private process-local map for the TTL.
 const tenantKeyCache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 
 /**
  * Returns an OpenAI client configured with the tenant's decrypted API key.
- * Falls back to the global OPENAI_API_KEY from environment only if no tenant key exists.
+ * Lookup order:
+ *   1. In-memory cache (5 min TTL)
+ *   2. tenant_secrets table (AES-256-GCM, per-tenant derived key)
+ *   3. ai_settings JSON column — legacy CBC fallback for tenants not yet migrated
+ *   4. Global OPENAI_API_KEY env var
  *
- * @param {string|null} tenant_id - Tenant identifier
- * @returns {Promise<OpenAI>} Configured OpenAI client
+ * Resolved keys are cached in private process memory, never logged or returned by APIs.
  */
 export const getOpenAIClient = async (tenant_id = null) => {
   let apiKey = process.env.OPENAI_API_KEY;
@@ -23,40 +29,45 @@ export const getOpenAIClient = async (tenant_id = null) => {
     if (cached && now - cached.timestamp < CACHE_TTL) {
       if (cached.key) apiKey = cached.key;
     } else {
+      let resolvedKey = null;
       try {
-        const tenant = await db.Tenants.findOne({
-          where: { tenant_id, is_deleted: false },
-          attributes: ["ai_settings"],
-          raw: true,
-        });
+        // 1. Try tenant_secrets (GCM)
+        resolvedKey = await getSecret(tenant_id, "openai");
 
-        if (tenant?.ai_settings) {
-          const settings =
-            typeof tenant.ai_settings === "string"
-              ? JSON.parse(tenant.ai_settings)
-              : tenant.ai_settings;
-
-          if (settings.openai_api_key) {
-            // Decrypt the stored encrypted key
-            const decryptedKey = decrypt(settings.openai_api_key);
-            if (decryptedKey) {
-              apiKey = decryptedKey;
+        // 2. Legacy fallback — CBC key still in ai_settings JSON
+        if (!resolvedKey) {
+          const tenant = await db.Tenants.findOne({
+            where: { tenant_id, is_deleted: false },
+            attributes: ["ai_settings"],
+            raw: true,
+          });
+          if (tenant?.ai_settings) {
+            const settings =
+              typeof tenant.ai_settings === "string"
+                ? JSON.parse(tenant.ai_settings)
+                : tenant.ai_settings;
+            if (settings.openai_api_key) {
+              resolvedKey = decrypt(settings.openai_api_key);
             }
           }
         }
-
-        tenantKeyCache.set(tenant_id, {
-          key: apiKey !== process.env.OPENAI_API_KEY ? apiKey : null,
-          timestamp: now,
-        });
       } catch (err) {
-        console.error(
-          "[getOpenAIClient] Failed to fetch/decrypt tenant API key:",
-          err.message,
-        );
+        console.error("[getOpenAIClient] Failed to resolve tenant API key:", err.message);
       }
+
+      if (resolvedKey) apiKey = resolvedKey;
+
+      tenantKeyCache.set(tenant_id, {
+        key: resolvedKey || null,
+        timestamp: now,
+      });
     }
   }
 
   return new OpenAI({ apiKey });
 };
+
+export function invalidateOpenAIClient(tenantId) {
+  if (tenantId) tenantKeyCache.delete(tenantId); else tenantKeyCache.clear();
+  invalidateModelAccess(tenantId);
+}

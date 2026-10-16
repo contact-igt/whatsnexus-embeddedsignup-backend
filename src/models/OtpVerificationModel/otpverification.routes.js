@@ -7,8 +7,7 @@ import {
 } from "./otpverification.controller.js";
 
 const router = express.Router();
-
-const tenantRoles = ["tenant_admin", "doctor", "staff", "agent"];
+const tenantRoles = ["tenant_admin", "staff"];
 
 /**
  * POST /whatsapp-otp/send

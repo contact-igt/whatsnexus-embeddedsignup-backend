@@ -7,6 +7,7 @@ import {
   getAllContactsService,
   getContactByIdAndTenantIdService,
   getContactByPhoneAndTenantIdService,
+  findContactByPhoneAnyStateService,
   updateContactService,
   getDeletedContactListService,
   restoreContactService,
@@ -51,6 +52,18 @@ export const createContactController = async (req, res) => {
     });
   }
 
+  if (!name || !name.toString().trim()) {
+    return res.status(400).json({ message: "Name is required" });
+  }
+
+  if (!email || !email.toString().trim()) {
+    return res.status(400).json({ message: "Email is required" });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.toString().trim())) {
+    return res.status(400).json({ message: "Invalid email format" });
+  }
+  email = email.toString().trim();
+
   // Clean phone
   phone = phone.toString().replace(/\D/g, "");
 
@@ -75,15 +88,28 @@ export const createContactController = async (req, res) => {
     : `+${country_code.toString().replace(/\D/g, "")}`;
 
   try {
-    const existingContact = await getContactByPhoneAndTenantIdService(
+    // Check for an existing contact in ANY state — do NOT use
+    // getContactByPhoneAndTenantIdService here: it silently auto-restores a
+    // trashed contact as a side effect.
+    const existingContact = await findContactByPhoneAnyStateService(
       tenant_id,
       phone,
       country_code,
     );
 
     if (existingContact) {
+      if (existingContact.is_deleted) {
+        return res.status(409).send({
+          message:
+            "This number already exists as a deleted contact. Open Trash and restore it to keep its chat history.",
+          code: "CONTACT_IN_TRASH",
+          contact_id: existingContact.contact_id,
+        });
+      }
       return res.status(409).send({
-        message: "This contact already exists",
+        message: "A contact with this phone number already exists.",
+        code: "CONTACT_EXISTS",
+        contact_id: existingContact.contact_id,
       });
     }
 
@@ -357,10 +383,30 @@ export const toggleSilenceAiController = async (req, res) => {
   const { is_ai_silenced } = req.body;
 
   try {
-    await toggleSilenceAiService(contact_id, tenant_id, is_ai_silenced);
+    const outcome = await toggleSilenceAiService(
+      contact_id,
+      tenant_id,
+      is_ai_silenced,
+    );
 
-    // Attempting to emit socket event if possible here, but usually socket is handled in messages/webhook
-    // We will just do a fast update. Frontend handles it optimism.
+    // Broadcast durable AI pause state so every connected dashboard updates.
+    try {
+      const { getIO } = await import("../../middlewares/socket/socket.js");
+      getIO()
+        ?.to(`tenant-${tenant_id}`)
+        .emit("contact-ai-state-updated", {
+          contactId: contact_id,
+          isAiSilenced: outcome?.is_ai_silenced ?? Boolean(is_ai_silenced),
+          pauseReason: outcome?.is_ai_silenced ? "manual" : null,
+          pausedAt: outcome?.is_ai_silenced ? new Date() : null,
+          aiReplyEpoch: outcome?.epoch ?? null,
+        });
+    } catch (emitErr) {
+      console.error(
+        "[CONTACT-AI-STATE] socket emit failed:",
+        emitErr.message,
+      );
+    }
 
     return res
       .status(200)

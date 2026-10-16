@@ -1,3 +1,4 @@
+import { AiModelCatalogTable, AiModelSyncTable, AiModelTestAttemptsTable } from "./tables/AiModelCatalogTable/index.js";
 import Sequelize from "sequelize";
 import DatabaseEnvironmentConfig from "../config/database.config.js";
 import ServerEnvironmentConfig from "../config/server.config.js";
@@ -9,7 +10,10 @@ import { ManagementTable } from "./tables/ManagementTable/index.js";
 import { ProcessedMessagesTable } from "./tables/ProcessedMessagesTable/index.js";
 import { ChatLocksTable } from "./tables/ChatLocksTable/index.js";
 import { TenantsTable } from "./tables/TenantsTable/index.js";
+import { BranchesTable } from "./tables/BranchesTable/index.js";
 import { LeadsTable } from "./tables/LeadsTable/index.js";
+import { MessageUnderstandingTable } from "./tables/MessageUnderstandingTable/index.js";
+import { LeadScoreHistoryTable } from "./tables/LeadScoreHistoryTable/index.js";
 import { ContactsTable } from "./tables/ContactsTable/index.js";
 import { LiveChatTable } from "./tables/LiveChatTable/index.js";
 import { TenantUsersTable } from "./tables/TenantUsersTable/index.js";
@@ -19,26 +23,35 @@ import { WhatsappTemplateComponentTable } from "./tables/WhatsappTemplateCompone
 import { WhatsappTemplateVariableTable } from "./tables/WhatsappTemplateVariablesTable/index.js";
 import { WhatsappTemplateSyncLogTable } from "./tables/WhatsappTemplateSyncLogsTable/index.js";
 import { WhatsappAccountTable } from "./tables/WhatsappAccountTable/index.js";
+import { WhatsappNumberIdentityTable } from "./tables/WhatsappNumberIdentityTable/index.js";
+import { WhatsappOnboardingSessionTable } from "./tables/WhatsappOnboardingSessionTable/index.js";
 import { WhatsappCampaignTable } from "./tables/WhatsappCampaignTable/index.js";
 import { WhatsappCampaignRecipientTable } from "./tables/WhatsappCampaignRecipientTable/index.js";
+import { CampaignEventsTable } from "./tables/CampaignEventsTable/index.js";
 import { ContactGroupTable } from "./tables/ContactGroupTable/index.js";
 import { ContactGroupMemberTable } from "./tables/ContactGroupMemberTable/index.js";
 import { SequencesTable } from "./tables/SequencesTable/index.js";
 import { OtpVerificationTable } from "./tables/OtpVerificationTable/index.js";
 import { DoctorsTable } from "./tables/DoctorsTable/index.js";
 import { DoctorAvailabilityTable } from "./tables/DoctorAvailabilityTable/index.js";
+import { DoctorAvailabilityDayTable } from "./tables/DoctorAvailabilityDayTable/index.js";
 import { SpecializationsTable } from "./tables/SpecializationsTable/index.js";
 import { DoctorSpecializationsTable } from "./tables/DoctorSpecializationsTable/index.js";
-import { AppointmentTable } from "./tables/AppointmentTable/index.js";
+import { DoctorBranchesTable } from "./tables/DoctorBranchesTable/index.js";
 import { PricingTable } from "./tables/PricingTableTable/index.js";
 import { MessageUsageTable } from "./tables/MessageUsageTable/index.js";
 import { BillingLedgerTable } from "./tables/BillingLedgerTable/index.js";
+import { BillingHoldTable } from "./tables/BillingHoldTable/index.js";
 import { WalletTable } from "./tables/WalletTable/index.js";
 import { WalletTransactionTable } from "./tables/WalletTransactionTable/index.js";
 import { AiTokenUsageTable } from "./tables/AiTokenUsageTable/index.js";
 import { AiPricingTable } from "./tables/AiPricingTable/index.js";
 import { PaymentHistoryTable } from "./tables/PaymentHistoryTable/index.js";
 import { BookingSessionTable } from "./tables/BookingSessionTable/index.js";
+import { AppointmentSlotTable } from "./tables/AppointmentSlotTable/index.js";
+import { AppointmentStateLogTable } from "./tables/AppointmentStateLogTable/index.js";
+import { AppointmentAuditLogTable } from "./tables/AppointmentAuditLogTable/index.js";
+import { ManageAppointmentSessionTable } from "./tables/ManageAppointmentSessionTable/index.js";
 import { BillingCycleTable } from "./tables/BillingCycleTable/index.js";
 import { MonthlyInvoiceTable } from "./tables/MonthlyInvoiceTable/index.js";
 import { AdminAuditLogTable } from "./tables/AdminAuditLogTable/index.js";
@@ -50,25 +63,63 @@ import { CronExecutionLogTable } from "./tables/CronExecutionLogTable/index.js";
 import { FaqReviewsTable } from "./tables/FaqTable/index.js";
 import { FaqKnowledgeSourceTable } from "./tables/FaqKnowledgeSourceTable/index.js";
 import { defineAssociations } from "./associations.js";
+import { MediaAssetTable } from "./tables/MediaAssetTable/index.js";
+import { AppointmentTable } from "./tables/AppointmentTable/index.js";
+import { AppointmentOutcomeTable } from "./tables/AppointmentOutcomeTable/index.js";
+import { SavedPaymentMethodTable } from "./tables/SavedPaymentMethod/SavedPaymentMethod.js";
+import { TaxSettingsTable } from "./tables/TaxSettingsTable/index.js";
+import { TenantSecretsTable } from "./tables/TenantSecretsTable/index.js";
+import { UserPreferencesTable } from "./tables/UserPreferencesTable/index.js";
+import { MentorsTable } from "./tables/MentorsTable/index.js";
+import { CoursesTable } from "./tables/CoursesTable/index.js";
+import { CourseSessionsTable } from "./tables/CourseSessionsTable/index.js";
+import { TenantFeatureAccessTable } from "./tables/TenantFeatureAccessTable/index.js";
+import { ScheduledMessageTable } from "./tables/ScheduledMessageTable/index.js";
+import { AppointmentReminderRulesTable } from "./tables/AppointmentReminderRulesTable/index.js";
+import { IndustriesTable } from "./tables/IndustriesTable/index.js";
+import { SaaSModulesTable } from "./tables/SaaSModulesTable/index.js";
+import { IndustrySaaSModulesTable } from "./tables/IndustrySaaSModulesTable/index.js";
+import { PlansTable } from "./tables/PlansTable/index.js";
+import { PlanSaaSModulesTable } from "./tables/PlanSaaSModulesTable/index.js";
+import { TenantSaaSModuleOverridesTable } from "./tables/TenantSaaSModuleOverridesTable/index.js";
+import { NavigationItemsTable } from "./tables/NavigationItemsTable/index.js";
+import { SidebarSectionsTable } from "./tables/SidebarSectionsTable/index.js";
+import { SidebarSectionIndustriesTable } from "./tables/SidebarSectionIndustriesTable/index.js";
+import { SidebarSectionPlansTable } from "./tables/SidebarSectionPlansTable/index.js";
+import { SidebarSectionTenantsTable } from "./tables/SidebarSectionTenantsTable/index.js";
+import { ApiRequestLogsTable } from "./tables/ApiRequestLogsTable/index.js";
+import { MetaMessagingLimitEventTable } from "./tables/MetaMessagingLimitEventTable/index.js";
+import { AiHandoffEventsTable } from "./tables/AiHandoffEventsTable/index.js";
 
 const dbconfig =
   ServerEnvironmentConfig?.server?.line === "production"
     ? DatabaseEnvironmentConfig?.live
     : ServerEnvironmentConfig?.server?.line === "development"
       ? DatabaseEnvironmentConfig?.development
-      : DatabaseEnvironmentConfig?.local;
+      : ServerEnvironmentConfig?.server?.line === "stage"
+        ? DatabaseEnvironmentConfig?.stage
+        : DatabaseEnvironmentConfig?.local;
 
 const sequelize = new Sequelize(
-  dbconfig?.databse,
+  dbconfig?.database,
   dbconfig?.user,
   dbconfig?.password,
   {
     host: dbconfig?.host,
+    port: dbconfig?.port ?? 3306,
     dialect: "mysql",
     timezone: "+05:30",
 
     dialectOptions: {
       charset: "utf8mb4",
+      connectTimeout: 60000,
+    },
+
+    pool: {
+      max: 10,
+      min: 0,
+      acquire: 60000,
+      idle: 10000,
     },
 
     define: {
@@ -87,6 +138,7 @@ db.sequelize = sequelize;
 
 db.Management = ManagementTable(sequelize, Sequelize);
 db.Tenants = TenantsTable(sequelize, Sequelize);
+db.Branches = BranchesTable(sequelize, Sequelize);
 db.TenantUsers = TenantUsersTable(sequelize, Sequelize);
 db.TenantInvitations = TenantInvitationsTable(sequelize, Sequelize);
 db.WhatsappTemplates = WhatsappTemplateTable(sequelize, Sequelize);
@@ -108,8 +160,11 @@ db.WhatsappCampaignRecipients = WhatsappCampaignRecipientTable(
   sequelize,
   Sequelize,
 );
+db.CampaignEvents = CampaignEventsTable(sequelize, Sequelize);
 
 db.Whatsappaccount = WhatsappAccountTable(sequelize, Sequelize);
+db.WhatsappNumberIdentity = WhatsappNumberIdentityTable(sequelize, Sequelize);
+db.WhatsappOnboardingSession = WhatsappOnboardingSessionTable(sequelize, Sequelize);
 db.KnowledgeSources = KnowledgeSourcesTable(sequelize, Sequelize);
 db.KnowledgeChunks = KnowledgeChunksTable(sequelize, Sequelize);
 db.AiPrompt = AiPromptTable(sequelize, Sequelize);
@@ -120,17 +175,21 @@ db.Messages = MessagesTable(sequelize, Sequelize);
 db.ProcessedMessage = ProcessedMessagesTable(sequelize, Sequelize);
 db.ChatLocks = ChatLocksTable(sequelize, Sequelize);
 db.Leads = LeadsTable(sequelize, Sequelize);
+db.MessageUnderstanding = MessageUnderstandingTable(sequelize, Sequelize);
+db.LeadScoreHistory = LeadScoreHistoryTable(sequelize, Sequelize);
 db.LiveChat = LiveChatTable(sequelize, Sequelize);
 db.Sequences = SequencesTable(sequelize, Sequelize);
 db.OtpVerification = OtpVerificationTable(sequelize, Sequelize);
 db.Doctors = DoctorsTable(sequelize, Sequelize);
 db.DoctorAvailability = DoctorAvailabilityTable(sequelize, Sequelize);
+db.DoctorAvailabilityDays = DoctorAvailabilityDayTable(sequelize, Sequelize);
 db.Specializations = SpecializationsTable(sequelize, Sequelize);
 db.DoctorSpecializations = DoctorSpecializationsTable(sequelize, Sequelize);
-db.Appointments = AppointmentTable(sequelize, Sequelize);
+db.DoctorBranches = DoctorBranchesTable(sequelize, Sequelize);
 db.PricingTable = PricingTable(sequelize, Sequelize);
 db.MessageUsage = MessageUsageTable(sequelize, Sequelize);
 db.BillingLedger = BillingLedgerTable(sequelize, Sequelize);
+db.BillingHolds = BillingHoldTable(sequelize, Sequelize);
 db.Wallets = WalletTable(sequelize, Sequelize);
 db.WalletTransactions = WalletTransactionTable(sequelize, Sequelize);
 db.AiTokenUsage = AiTokenUsageTable(sequelize, Sequelize);
@@ -146,11 +205,55 @@ db.MonthlyUsageSummary = MonthlyUsageSummaryTable(sequelize, Sequelize);
 db.CronExecutionLog = CronExecutionLogTable(sequelize, Sequelize);
 db.FaqReviews = FaqReviewsTable(sequelize, Sequelize);
 db.FaqKnowledgeSource = FaqKnowledgeSourceTable(sequelize, Sequelize);
-// db.BookingSession = BookingSessionTable(sequelize, Sequelize);
+db.MediaAsset = MediaAssetTable(sequelize, Sequelize);
+db.Appointments = AppointmentTable(sequelize, Sequelize);
+db.AppointmentOutcomes = AppointmentOutcomeTable(sequelize, Sequelize);
+db.BookingSessions = BookingSessionTable(sequelize, Sequelize);
+db.AppointmentSlots = AppointmentSlotTable(sequelize, Sequelize);
+db.AppointmentStateLogs = AppointmentStateLogTable(sequelize, Sequelize);
+db.AppointmentAuditLogs = AppointmentAuditLogTable(sequelize, Sequelize);
+db.ManageAppointmentSessions = ManageAppointmentSessionTable(
+  sequelize,
+  Sequelize,
+);
+db.SavedPaymentMethod = SavedPaymentMethodTable(sequelize, Sequelize);
+db.TaxSettings = TaxSettingsTable(sequelize, Sequelize);
+db.TenantSecrets = TenantSecretsTable(sequelize, Sequelize);
+db.UserPreferences = UserPreferencesTable(sequelize, Sequelize);
+db.Mentors = MentorsTable(sequelize, Sequelize);
+db.Courses = CoursesTable(sequelize, Sequelize);
+db.CourseSessions = CourseSessionsTable(sequelize, Sequelize);
+db.TenantFeatureAccess = TenantFeatureAccessTable(sequelize, Sequelize);
+db.ScheduledMessages = ScheduledMessageTable(sequelize, Sequelize);
+db.AppointmentReminderRules = AppointmentReminderRulesTable(
+  sequelize,
+  Sequelize,
+);
+db.Industries = IndustriesTable(sequelize, Sequelize);
+db.SaaSModules = SaaSModulesTable(sequelize, Sequelize);
+db.IndustrySaaSModules = IndustrySaaSModulesTable(sequelize, Sequelize);
+db.Plans = PlansTable(sequelize, Sequelize);
+db.PlanSaaSModules = PlanSaaSModulesTable(sequelize, Sequelize);
+db.TenantSaaSModuleOverrides = TenantSaaSModuleOverridesTable(
+  sequelize,
+  Sequelize,
+);
+db.NavigationItems = NavigationItemsTable(sequelize, Sequelize);
+db.SidebarSections = SidebarSectionsTable(sequelize, Sequelize);
+db.SidebarSectionIndustries = SidebarSectionIndustriesTable(
+  sequelize,
+  Sequelize,
+);
+db.SidebarSectionPlans = SidebarSectionPlansTable(sequelize, Sequelize);
+db.SidebarSectionTenants = SidebarSectionTenantsTable(sequelize, Sequelize);
+db.ApiRequestLogs = ApiRequestLogsTable(sequelize, Sequelize);
+db.MetaMessagingLimitEvents = MetaMessagingLimitEventTable(sequelize, Sequelize);
+db.AiHandoffEvents = AiHandoffEventsTable(sequelize, Sequelize);
 
-// ========================================
-// IMPORT AND DEFINE ASSOCIATIONS
-// ========================================
+// Catalog records never own pricing/usage history; no cascading deletes.
+db.AiModelCatalog = AiModelCatalogTable(sequelize, Sequelize);
+db.AiModelSync = AiModelSyncTable(sequelize, Sequelize);
+db.AiModelTestAttempts = AiModelTestAttemptsTable(sequelize, Sequelize);
 defineAssociations(db);
 
 export default db;

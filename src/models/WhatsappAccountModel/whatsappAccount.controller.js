@@ -4,14 +4,37 @@ import {
   getWhatsappAccountByTenantService,
   updateWhatsappAccountStatusService,
   updateAccessTokenService,
+  updateWhatsappAccountService,
   softDeleteWhatsappAccountService,
   permanentDeleteWhatsappAccountService,
   syncWabaMetaInfoService,
   subscribeToWebhookFieldsService,
   validateMetaSubscriptionService,
-  META_TIER_CONFIG,
 } from "./whatsappAccount.service.js";
 import { missingFieldsChecker } from "../../utils/helpers/missingFields.js";
+import ServerEnvironmentConfig from "../../config/server.config.js";
+import { resolveMetaTier } from "../../utils/metaMessagingTier.js";
+import { resolveConnectionType } from "./whatsappConnectionTypes.js";
+
+const buildMessagingLimitResponse = (account, syncResult = null) => {
+  const tier = resolveMetaTier(syncResult?.tier || account?.tier);
+  return {
+    tier_key: tier.tierKey,
+    tier_name: tier.tierName,
+    daily_limit: tier.dailyLimit,
+    is_unlimited: tier.isUnlimited,
+    is_known: tier.isKnown,
+    upgrade_target: tier.upgradeTarget,
+    upgrade_window_days: tier.upgradeWindowDays,
+    next_tier_key: tier.nextTierKey,
+    allows_verification_path: tier.allowsVerificationPath,
+    requires_high_quality: tier.requiresHighQuality,
+    quality: syncResult?.quality || account?.quality || "UNKNOWN",
+    source: syncResult?.source || "cache",
+    synced_at: syncResult?.synced_at || account?.meta_info_synced_at || null,
+    is_estimate: true,
+  };
+};
 
 export const whatsappOAuthCallbackController = async (req, res) => {
   try {
@@ -86,10 +109,11 @@ export const whatsappOAuthCallbackController = async (req, res) => {
       phone.id,
       waba.id,
       access_token,
+      process.env.META_APP_ID,
     );
 
     return res.redirect(
-      `${process.env.FRONTEND_URL}/settings/whatsapp?status=connected`,
+      `${ServerEnvironmentConfig.urls.frontend}/settings/whatsapp?status=connected`,
     );
   } catch (err) {
     return res.status(500).send({
@@ -103,7 +127,7 @@ export const manualConnectWhatsappController = async (req, res) => {
   try {
     const tenant_id = req.user.tenant_id;
 
-    const { whatsapp_number, phone_number_id, waba_id, access_token } =
+    const { whatsapp_number, phone_number_id, waba_id, access_token, app_id } =
       req.body;
 
     if (!tenant_id) {
@@ -130,6 +154,7 @@ export const manualConnectWhatsappController = async (req, res) => {
       phone_number_id,
       waba_id,
       access_token,
+      app_id,
     );
 
     return res.status(200).send({
@@ -143,50 +168,56 @@ export const manualConnectWhatsappController = async (req, res) => {
 };
 
 export const testWhatsappAccountController = async (req, res) => {
-  const tenant_id = req.user.tenant_id;
-
-  const account = await getWhatsappAccountByTenantService(tenant_id);
-
-  if (!account) {
-    return res.status(404).send({ message: "WhatsApp account not found" });
-  }
-
   try {
-    await axios.get(
-      `https://graph.facebook.com/v19.0/${account.phone_number_id}`,
-      {
-        headers: {
-          Authorization: `Bearer ${account.access_token}`,
+    const tenant_id = req.user.tenant_id;
+
+    const account = await getWhatsappAccountByTenantService(tenant_id);
+
+    if (!account) {
+      return res.status(404).send({ message: "WhatsApp account not found. Please save your credentials first." });
+    }
+
+    if (!account.access_token) {
+      return res.status(400).send({ message: "Access token not found. Please re-enter and save your credentials." });
+    }
+
+    try {
+      await axios.get(
+        `https://graph.facebook.com/v25.0/${account.phone_number_id}`,
+        {
+          headers: {
+            Authorization: `Bearer ${account.access_token}`,
+          },
+          timeout: 10000,
         },
-      },
-    );
+      );
 
-    await updateWhatsappAccountStatusService(account.id, "verified", null);
+      await updateWhatsappAccountStatusService(account.id, "verified", null);
 
-    return res.status(200).send({
-      message:
-        "WhatsApp connection verified successfully! You can now activate your account.",
-      status: "verified",
-    });
+      return res.status(200).send({
+        message: "WhatsApp connection verified successfully! You can now activate your account.",
+        status: "verified",
+      });
+    } catch (err) {
+      const isNetworkError = err.code === "ENOTFOUND" || err.code === "ECONNREFUSED" || err.code === "ETIMEDOUT";
+
+      const metaError =
+        err.response?.data?.error?.message || err.response?.data || err.message;
+
+      await updateWhatsappAccountStatusService(
+        account.id,
+        "failed",
+        isNetworkError ? "Server cannot reach Meta (DNS/network issue)" : metaError,
+      );
+
+      return res.status(500).send({
+        message: isNetworkError
+          ? "Server network issue. Please contact support."
+          : `WhatsApp verification failed: ${metaError}`,
+      });
+    }
   } catch (err) {
-    const isNetworkError = err.code === "ENOTFOUND";
-
-    const metaError =
-      err.response?.data?.error?.message || err.response?.data || err.message;
-
-    await updateWhatsappAccountStatusService(
-      account.id,
-      "failed",
-      isNetworkError
-        ? "Server cannot reach Meta (DNS/network issue)"
-        : metaError,
-    );
-
-    return res.status(500).send({
-      message: isNetworkError
-        ? "Server network issue. Please contact support."
-        : `WhatsApp verification failed: ${metaError}`,
-    });
+    return res.status(500).send({ message: err.message || "Unexpected error during connection test." });
   }
 };
 
@@ -243,6 +274,34 @@ export const testWhatsappAccountController = async (req, res) => {
 //     });
 //   }
 // };
+
+export const updateWhatsappAccountController = async (req, res) => {
+  try {
+    const tenant_id = req.user.tenant_id;
+    const { waba_id, phone_number_id, whatsapp_number, app_id, access_token } = req.body;
+
+    if (!waba_id && !phone_number_id && !whatsapp_number && !app_id && !access_token) {
+      return res.status(400).send({ message: "No fields provided to update." });
+    }
+
+    if (access_token && access_token.length < 50) {
+      return res.status(400).send({ message: "Access token is too short. Please enter a valid token." });
+    }
+
+    const account = await getWhatsappAccountByTenantService(tenant_id);
+    if (!account) {
+      return res.status(404).send({ message: "WhatsApp account not found" });
+    }
+
+    await updateWhatsappAccountService(tenant_id, { waba_id, phone_number_id, whatsapp_number, app_id, access_token });
+
+    return res.status(200).send({
+      message: "WhatsApp account updated successfully. Please test connection to verify.",
+    });
+  } catch (err) {
+    return res.status(500).send({ message: err.message });
+  }
+};
 
 export const updateAccessTokenController = async (req, res) => {
   try {
@@ -332,22 +391,26 @@ export const getWhatsappAccountController = async (req, res) => {
     const account = await getWhatsappAccountByTenantService(tenant_id);
 
     if (!account) {
-      return res.status(404).send({ message: "WhatsApp account not found" });
+      return res.status(200).send({ data: null });
     }
 
-    // Non-blocking: refresh quality & tier from Meta in background
-    // so next dashboard load always has up-to-date values
-    syncWabaMetaInfoService(tenant_id).catch((e) =>
-      console.error("[WABA Sync] Background sync failed:", e.message),
-    );
+    const syncResult = await syncWabaMetaInfoService(tenant_id);
+    const messagingLimit = buildMessagingLimitResponse(account, syncResult);
 
-    return res.status(200).send({
-      data: account,
-    });
+    // Never expose the raw token to the frontend
+    const { access_token, ...safeAccount } = account;
+    safeAccount.has_access_token = !!access_token;
+    // NULL (every pre-existing row) reads as LEGACY_MANUAL — nothing is rewritten.
+    safeAccount.whatsapp_connection_type = resolveConnectionType(
+      account.whatsapp_connection_type,
+    );
+    safeAccount.quality = messagingLimit.quality;
+    safeAccount.tier = messagingLimit.tier_key;
+    safeAccount.messaging_limit = messagingLimit;
+
+    return res.status(200).send({ data: safeAccount });
   } catch (err) {
-    return res.status(500).send({
-      error: err.message,
-    });
+    return res.status(500).send({ error: err.message });
   }
 };
 
@@ -358,25 +421,15 @@ export const getTierLimitController = async (req, res) => {
     const account = await getWhatsappAccountByTenantService(tenant_id);
 
     if (!account) {
-      return res.status(404).send({ message: "WhatsApp account not found" });
+      return res.status(200).send({ data: null });
     }
 
-    // Trigger background sync so data stays fresh without blocking the response
-    syncWabaMetaInfoService(tenant_id).catch((e) =>
-      console.error("[Tier Sync] Background sync failed:", e.message),
-    );
-
-    const tierKey = account.tier || "TIER_NOT_SET";
-    const tierConfig = META_TIER_CONFIG[tierKey] || META_TIER_CONFIG["TIER_NOT_SET"];
+    const syncResult = await syncWabaMetaInfoService(tenant_id);
+    const messagingLimit = buildMessagingLimitResponse(account, syncResult);
 
     return res.status(200).send({
       data: {
-        tier_key: tierKey,
-        tier_name: tierConfig.name,
-        // Limit is unique users per 24h across the entire WABA (portfolio-level)
-        daily_limit: tierConfig.limit === Infinity ? "Unlimited" : tierConfig.limit,
-        upgrade_hint: tierConfig.upgradeHint,
-        quality: account.quality || "GREEN",
+        ...messagingLimit,
         phone_number: account.whatsapp_number,
         waba_id: account.waba_id,
       },

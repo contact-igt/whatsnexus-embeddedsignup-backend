@@ -1,5 +1,6 @@
 import db from "../../database/index.js";
 import { tableNames } from "../../database/tableName.js";
+import { getHistoryScope } from "../WhatsappAccountModel/whatsappNumberScope.service.js";
 import { AiService } from "../../utils/ai/coreAi.js";
 import { processResponse } from "../../utils/ai/aiTagHandlers/index.js";
 import { searchKnowledgeChunks } from "../Knowledge/knowledge.search.js";
@@ -11,7 +12,7 @@ import {
   getAdminSystemPrompt,
   getAdminSuggestedReplyPrompt,
   getAdminLeadSourcePrompt,
-  getAdminAppointmentHistoryPrompt,
+  // getAdminAppointmentHistoryPrompt,
 } from "../../utils/ai/prompts/index.js";
 
 export const createUserMessageService = async (
@@ -30,8 +31,9 @@ export const createUserMessageService = async (
   status = null,
   template_name = null,
   media_filename = null,
+  interactive_payload = null,
 ) => {
-  const Query = `INSERT INTO ${tableNames?.MESSAGES} (  
+  const Query = `INSERT IGNORE INTO ${tableNames?.MESSAGES} (  
   tenant_id,
   contact_id,
   phone_number_id,
@@ -46,9 +48,11 @@ export const createUserMessageService = async (
   media_url,
   media_mime_type,
   status,
+  billing_mode_snapshot,
   template_name,
+  interactive_payload,
   media_filename )
-   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) `;
+   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) `;
 
   try {
     let cleanPhone = phone ? phone.toString().replace(/\D/g, "") : "";
@@ -61,6 +65,15 @@ export const createUserMessageService = async (
       // It's already 10 digits, keep default cc or retrieve from contact
     }
 
+    let billingModeSnapshot = null;
+    if (sender !== "user" && wamid) {
+      const tenant = await db.Tenants.findOne({
+        where: { tenant_id },
+        attributes: ["billing_mode"],
+        raw: true,
+      });
+      billingModeSnapshot = tenant?.billing_mode || "prepaid";
+    }
     const values = [
       tenant_id,
       contact_id,
@@ -76,24 +89,33 @@ export const createUserMessageService = async (
       media_url,
       media_mime_type,
       status,
+      billingModeSnapshot,
       template_name,
+      interactive_payload,
       media_filename,
     ];
 
     const [result] = await db.sequelize.query(Query, { replacements: values });
-    return { id: result };
+    // result is a ResultSetHeader — extract the actual auto-increment ID
+    const insertId = result?.insertId ?? result;
+    return { id: insertId };
   } catch (err) {
     throw err;
   }
 };
 
 export const getChatListService = async (tenant_id, limit = 200) => {
+  // Empty (query unchanged) unless the org switched to a different business number.
+  const scope = await getHistoryScope(tenant_id);
   const dataQuery = `
   SELECT
     m.contact_id,
     c.phone,
     c.name,
     c.is_ai_silenced,
+    c.ai_pause_reason,
+    c.ai_paused_at,
+    c.ai_reply_epoch,
     m.message,
     m.message_type,
     m.created_at AS last_message_time,
@@ -102,22 +124,24 @@ export const getChatListService = async (tenant_id, limit = 200) => {
   INNER JOIN (
     SELECT
       contact_id,
-      MAX(created_at) AS last_message_time
+      MAX(created_at) AS last_message_time,
+      MAX(id) AS last_message_id
     FROM messages
-    WHERE tenant_id = ? AND is_deleted = false
+    WHERE tenant_id = ? AND is_deleted = false${scope.sql}
     GROUP BY contact_id
   ) lm
     ON m.contact_id = lm.contact_id
-   AND m.created_at = lm.last_message_time
+   AND m.id = lm.last_message_id
   JOIN contacts c
     ON c.contact_id = m.contact_id
+   AND c.tenant_id = m.tenant_id
   LEFT JOIN ${tableNames.LIVECHAT} lc
     ON lc.contact_id = m.contact_id
    AND lc.tenant_id = ?
   LEFT JOIN (
     SELECT contact_id, COUNT(*) AS cnt
     FROM ${tableNames.MESSAGES}
-    WHERE tenant_id = ? AND seen = false AND sender = 'user' AND is_deleted = false
+    WHERE tenant_id = ? AND seen = false AND sender = 'user' AND is_deleted = false${scope.sql}
     GROUP BY contact_id
   ) uc ON uc.contact_id = m.contact_id
   WHERE m.tenant_id = ?
@@ -128,7 +152,15 @@ export const getChatListService = async (tenant_id, limit = 200) => {
 
   try {
     const [rows] = await db.sequelize.query(dataQuery, {
-      replacements: [tenant_id, tenant_id, tenant_id, tenant_id, limit],
+      replacements: [
+        tenant_id,
+        ...scope.params,
+        tenant_id,
+        tenant_id,
+        ...scope.params,
+        tenant_id,
+        limit,
+      ],
     });
 
     return rows;
@@ -160,17 +192,22 @@ export const getChatByPhoneService = async (phone, tenant_id) => {
       replacements = [suffix, tenant_id];
     }
 
+    // Fetch the most recent 500 messages (newest first), then return them in
+    // ascending order. Ordering ASC + LIMIT would silently drop the newest
+    // messages (e.g. a just-sent campaign/template message) once a conversation
+    // exceeds 500 rows.
+    const scope = await getHistoryScope(tenant_id);
     const Query = `
-    SELECT id, contact_id, sender, sender_id, message, message_type, media_url, media_mime_type, media_filename, seen, status, created_at
+    SELECT id, contact_id, sender, sender_id, message, message_type, interactive_payload, media_url, media_mime_type, media_filename, seen, status, wamid, created_at
     FROM ${tableNames?.MESSAGES}
-    WHERE ${whereClause} AND is_deleted = false
-    ORDER BY created_at ASC
+    WHERE ${whereClause} AND is_deleted = false${scope.sql}
+    ORDER BY created_at DESC
     LIMIT 500
   `;
     const [result] = await db.sequelize.query(Query, {
-      replacements: replacements,
+      replacements: [...replacements, ...scope.params],
     });
-    return result;
+    return Array.isArray(result) ? result.reverse() : result;
   } catch (err) {
     throw err;
   }
@@ -194,9 +231,10 @@ export const markSeenMessageService = async (tenant_id, phone) => {
       replacements = [suffix, tenant_id];
     }
 
-    const Query = `UPDATE ${tableNames?.MESSAGES} SET seen = true WHERE ${whereClause} AND tenant_id = ? AND seen = false AND sender = 'user'`;
+    const scope = await getHistoryScope(tenant_id);
+    const Query = `UPDATE ${tableNames?.MESSAGES} SET seen = true WHERE ${whereClause} AND tenant_id = ? AND seen = false AND sender = 'user'${scope.sql}`;
     const [result] = await db.sequelize.query(Query, {
-      replacements: replacements,
+      replacements: [...replacements, ...scope.params],
     });
     return result;
   } catch (err) {
@@ -221,14 +259,6 @@ export const suggestReplyService = async (tenant_id, phone) => {
         if (lead && lead.source === "none") {
           leadSourcePrompt = getAdminLeadSourcePrompt();
         }
-
-        // 2. Appointment History Detection
-        const lastAppointment = await getLastAppointmentService(
-          tenant_id,
-          contact_id,
-        );
-        appointmentHistoryPrompt =
-          getAdminAppointmentHistoryPrompt(lastAppointment);
       }
     } catch (err) {
       console.error(
@@ -250,15 +280,16 @@ export const suggestReplyService = async (tenant_id, phone) => {
       msgReplacements = [contact_id, tenant_id];
     }
 
+    const scope = await getHistoryScope(tenant_id);
     const [messages] = await db.sequelize.query(
       `
     SELECT sender, message, created_at
     FROM ${tableNames.MESSAGES}
-    WHERE ${msgWhere}
+    WHERE ${msgWhere}${scope.sql}
     ORDER BY created_at DESC
     LIMIT 30
     `,
-      { replacements: msgReplacements },
+      { replacements: [...msgReplacements, ...scope.params] },
     );
 
     // Reverse to get chronological order and format nicely
@@ -279,12 +310,12 @@ export const suggestReplyService = async (tenant_id, phone) => {
       `
     SELECT message
     FROM ${tableNames.MESSAGES}
-    WHERE ${msgWhere}
+    WHERE ${msgWhere}${scope.sql}
     AND sender = 'user'
     ORDER BY created_at DESC
     LIMIT 1
     `,
-      { replacements: msgReplacements },
+      { replacements: [...msgReplacements, ...scope.params] },
     );
 
     if (!lastMsg.length) {
@@ -316,7 +347,7 @@ export const suggestReplyService = async (tenant_id, phone) => {
       "smart_reply",
     );
 
-    console.log("[AI-RAW-RESPONSE]", rawReply);
+    
 
     // Step 1: Process tags (Self-Tagging) and extract metadata
     const processed = await processResponse(rawReply, {
@@ -329,7 +360,7 @@ export const suggestReplyService = async (tenant_id, phone) => {
 
     const cleanReply = processed.message;
 
-    console.log("[AI-CLEAN-RESPONSE]", cleanReply);
+    
 
     return cleanReply;
   } catch (err) {

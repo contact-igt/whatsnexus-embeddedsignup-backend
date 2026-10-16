@@ -1,4 +1,6 @@
-import db from "../../database/index.js";
+import { eligibleModel } from "../../utils/ai/modelRuntime.js";
+import { invalidateOpenAIClient } from "../../utils/ai/getOpenAIClient.js";
+﻿import db from "../../database/index.js";
 import { tableNames } from "../../database/tableName.js";
 import { generateReadableIdFromLast } from "../../utils/helpers/generateReadableIdFromLast.js";
 import { missingFieldsChecker } from "../../utils/helpers/missingFields.js";
@@ -43,7 +45,94 @@ import {
 
 import { getComprehensiveWebhookStatusService } from "../WhatsappAccountModel/whatsappAccount.service.js";
 import { encrypt, decrypt, maskApiKey } from "../../utils/encryption.js";
+import { storeSecret, getSecret } from "../TenantSecretsModel/tenantSecrets.service.js";
 import OpenAI from "openai";
+
+const ALLOWED_INDUSTRY_TYPES = ["healthcare", "education", "general"];
+
+const mapIndustryToLegacyType = (industryType = "general") => {
+  if (industryType === "healthcare") return "hospital";
+  if (industryType === "education") return "education";
+  return "organization";
+};
+
+const normalizeOptionalLookupId = (value) => {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+};
+
+const validateIndustryIdExists = async (industry_id) => {
+  if (industry_id === undefined || industry_id === null) return;
+
+  const industry = await db.Industries.findOne({
+    where: { industry_id },
+    attributes: ["industry_id"],
+    raw: true,
+  });
+
+  if (!industry) {
+    const error = new Error(`Invalid industry_id: ${industry_id}`);
+    error.statusCode = 400;
+    throw error;
+  }
+};
+
+const validatePlanIdExists = async (plan_id) => {
+  if (plan_id === undefined || plan_id === null) return;
+
+  const plan = await db.Plans.findOne({
+    where: { plan_id },
+    attributes: ["plan_id"],
+    raw: true,
+  });
+
+  if (!plan) {
+    const error = new Error(`Invalid plan_id: ${plan_id}`);
+    error.statusCode = 400;
+    throw error;
+  }
+};
+
+/**
+ * Validate the tenant's chosen AI models against the catalog: each must be
+ * active, approved, priced and purpose/modality compatible.
+ *
+ * @param {object} settings - the ai_settings object being saved
+ * @param {string|null} tenantId
+ * @param {boolean} [checkCredentialAccess=false] - also probe the effective
+ *   credential live (only for the dedicated AI-settings save, where the tenant
+ *   and its key already exist; skipped during tenant create/update).
+ */
+const validateAiModelSelections = async (settings, tenantId = null, checkCredentialAccess = false) => {
+  if (!settings) return null;
+  try {
+    // A model the tenant is NOT already on must have a real passed live test.
+    // Keeping an existing legacy_grandfathered selection is allowed.
+    let current = {};
+    if (tenantId) {
+      const tenant = await db.Tenants.findOne({ where: { tenant_id: tenantId, is_deleted: false }, attributes: ["ai_settings"], raw: true });
+      current = typeof tenant?.ai_settings === "string" ? JSON.parse(tenant.ai_settings || "{}") : (tenant?.ai_settings || {});
+    }
+    for (const purpose of ["input", "output", "vision"]) {
+      const keys = [purpose === "vision" ? "vision_model" : `${purpose}_model`, `${purpose}_fallback_model`];
+      for (const key of keys) {
+        if (settings[key]) {
+          const isUnchanged = current[key] === settings[key];
+          await eligibleModel(settings[key], purpose, tenantId, {
+            skipAccessCheck: !checkCredentialAccess,
+            requireLiveTest: !isUnchanged,
+          });
+        }
+      }
+    }
+    return null;
+  } catch (error) {
+    return error?.statusCode ? error.message : "Unable to validate the selected AI model.";
+  }
+};
 
 export const createTenantController = async (req, res) => {
   const loginUSer = req.user;
@@ -55,7 +144,7 @@ export const createTenantController = async (req, res) => {
       owner_email,
       owner_country_code,
       owner_mobile,
-      type,
+      industry_type,
       subscriptionStatus,
       subscription_start_date,
       subscription_end_date,
@@ -66,6 +155,8 @@ export const createTenantController = async (req, res) => {
       pincode,
       maxUsers,
       subscriptionPlan,
+      industry_id,
+      plan_id,
       profile,
       ai_settings,
     } = req.body;
@@ -76,7 +167,6 @@ export const createTenantController = async (req, res) => {
       owner_email,
       owner_country_code,
       owner_mobile,
-      type,
     };
 
     const missingFields = await missingFieldsChecker(requiredFields);
@@ -84,6 +174,37 @@ export const createTenantController = async (req, res) => {
       return res.status(400).json({
         message: `Missing required field(s): ${missingFields.join(", ")}`,
       });
+    }
+
+    if (
+      industry_type !== undefined &&
+      !ALLOWED_INDUSTRY_TYPES.includes(industry_type)
+    ) {
+      return res.status(400).json({
+        message:
+          "Invalid industry_type. Allowed values: healthcare, education, general",
+      });
+    }
+
+    const resolvedIndustryType = industry_type || "general";
+    const resolvedLegacyType = mapIndustryToLegacyType(resolvedIndustryType);
+    const normalizedIndustryId = normalizeOptionalLookupId(industry_id);
+    const normalizedPlanId = normalizeOptionalLookupId(plan_id);
+
+    if (
+      normalizedIndustryId !== undefined &&
+      normalizedIndustryId !== null &&
+      typeof normalizedIndustryId !== "string"
+    ) {
+      return res.status(400).json({ message: "industry_id must be a string or null" });
+    }
+
+    if (
+      normalizedPlanId !== undefined &&
+      normalizedPlanId !== null &&
+      typeof normalizedPlanId !== "string"
+    ) {
+      return res.status(400).json({ message: "plan_id must be a string or null" });
     }
 
     const tenant_id = await generateReadableIdFromLast(
@@ -95,6 +216,14 @@ export const createTenantController = async (req, res) => {
     const cleanedCC = cleanCountryCode(owner_country_code);
     const normalizedMobile = normalizeMobile(cleanedCC, owner_mobile);
     const trimmedEmail = owner_email?.trim()?.toLowerCase();
+
+    const aiModelValidationError = await validateAiModelSelections(ai_settings, tenant_id);
+    if (aiModelValidationError) {
+      return res.status(400).json({ message: aiModelValidationError });
+    }
+
+    await validateIndustryIdExists(normalizedIndustryId);
+    await validatePlanIdExists(normalizedPlanId);
 
     // Check for existing user in Tenants
     const existingTu = await findTenantUserByEmailOrMobileGloballyService(
@@ -119,7 +248,7 @@ export const createTenantController = async (req, res) => {
         trimmedEmail,
         cleanedCC,
         normalizedMobile,
-        type,
+        resolvedLegacyType,
         subscriptionStatus || "invited",
         subscription_start_date || null,
         subscription_end_date || null,
@@ -135,12 +264,14 @@ export const createTenantController = async (req, res) => {
         (() => {
           if (!ai_settings) return null;
           const settings = { ...ai_settings };
-          if (settings.openai_api_key) {
-            settings.openai_api_key = encrypt(settings.openai_api_key);
-          }
+          // Never store the raw key in the JSON column — storeSecret handles it after tenant is created
+          delete settings.openai_api_key;
           return settings;
         })(),
         t, // transaction
+        resolvedIndustryType,
+        normalizedIndustryId,
+        normalizedPlanId,
       );
 
       tenantUserId = await generateReadableIdFromLast(
@@ -164,6 +295,11 @@ export const createTenantController = async (req, res) => {
         t, // transaction
       );
     });
+
+    // Store OpenAI key in tenant_secrets after transaction commits (outside tx — no rollback risk)
+    if (ai_settings?.openai_api_key) {
+      await storeSecret(tenant_id, "openai", ai_settings.openai_api_key);
+    }
 
     // Send invitation email OUTSIDE the transaction — tenant is already saved,
     // so a transient SMTP failure won't roll back the entire registration.
@@ -192,6 +328,10 @@ export const createTenantController = async (req, res) => {
         "Tenant created successfully. Invitation email sent to owner.",
     });
   } catch (err) {
+    if (err?.statusCode) {
+      return res.status(err.statusCode).json({ message: err.message });
+    }
+
     if (err.original?.code === "ER_DUP_ENTRY") {
       return res.status(400).json({
         message: "Email or mobile already exists",
@@ -244,7 +384,7 @@ export const updateTenantController = async (req, res) => {
       owner_email,
       owner_country_code,
       owner_mobile,
-      type,
+      industry_type,
       subscriptionStatus,
       subscription_start_date,
       subscription_end_date,
@@ -255,6 +395,8 @@ export const updateTenantController = async (req, res) => {
       pincode,
       maxUsers,
       subscriptionPlan,
+      industry_id,
+      plan_id,
       profile,
       ai_settings,
     } = req.body;
@@ -263,6 +405,16 @@ export const updateTenantController = async (req, res) => {
 
     if (!tenant) {
       return res.status(404).json({ message: "Tenant details not found" });
+    }
+
+    if (
+      industry_type !== undefined &&
+      !ALLOWED_INDUSTRY_TYPES.includes(industry_type)
+    ) {
+      return res.status(400).json({
+        message:
+          "Invalid industry_type. Allowed values: healthcare, education, general",
+      });
     }
 
     const cleanedCC = owner_country_code
@@ -276,6 +428,11 @@ export const updateTenantController = async (req, res) => {
     console.log(
       `[UPDATE TENANT] ID: ${id}, New Email: ${trimmedEmail}, Old Email: ${tenant.owner_email}`,
     );
+
+    const aiModelValidationError = await validateAiModelSelections(ai_settings, id);
+    if (aiModelValidationError) {
+      return res.status(400).json({ message: aiModelValidationError });
+    }
 
     // Check for duplicate email if it's changing
     if (trimmedEmail && trimmedEmail !== tenant.owner_email) {
@@ -293,13 +450,39 @@ export const updateTenantController = async (req, res) => {
       }
     }
 
+    const resolvedLegacyTypeForUpdate =
+      industry_type !== undefined && industry_type !== null
+        ? mapIndustryToLegacyType(industry_type)
+        : undefined;
+    const normalizedIndustryId = normalizeOptionalLookupId(industry_id);
+    const normalizedPlanId = normalizeOptionalLookupId(plan_id);
+
+    if (
+      normalizedIndustryId !== undefined &&
+      normalizedIndustryId !== null &&
+      typeof normalizedIndustryId !== "string"
+    ) {
+      return res.status(400).json({ message: "industry_id must be a string or null" });
+    }
+
+    if (
+      normalizedPlanId !== undefined &&
+      normalizedPlanId !== null &&
+      typeof normalizedPlanId !== "string"
+    ) {
+      return res.status(400).json({ message: "plan_id must be a string or null" });
+    }
+
+    await validateIndustryIdExists(normalizedIndustryId);
+    await validatePlanIdExists(normalizedPlanId);
+
     await updateTenantService(
       company_name,
       owner_name,
       trimmedEmail || owner_email,
       cleanedCC,
       normalizedMobile,
-      type,
+      resolvedLegacyTypeForUpdate,
       subscriptionStatus,
       subscription_start_date,
       subscription_end_date,
@@ -314,13 +497,20 @@ export const updateTenantController = async (req, res) => {
       (() => {
         if (!ai_settings) return ai_settings;
         const settings = { ...ai_settings };
-        if (settings.openai_api_key) {
-          settings.openai_api_key = encrypt(settings.openai_api_key);
-        }
+        // Never store the raw key in the JSON column — storeSecret handles it below
+        delete settings.openai_api_key;
         return settings;
       })(),
       id,
+      industry_type,
+      normalizedIndustryId,
+      normalizedPlanId,
     );
+
+    // Store OpenAI key in tenant_secrets if provided via this path
+    if (ai_settings?.openai_api_key) {
+      await storeSecret(id, "openai", ai_settings.openai_api_key);
+    }
 
     // Sync changes to the primary tenant admin user
     const tenantAdmin = await findTenantAdminService(id);
@@ -362,6 +552,10 @@ export const updateTenantController = async (req, res) => {
       message: "Tenant updated successfully",
     });
   } catch (err) {
+    if (err?.statusCode) {
+      return res.status(err.statusCode).json({ message: err.message });
+    }
+
     if (err.original?.code === "ER_DUP_ENTRY") {
       return res
         .status(400)
@@ -475,7 +669,7 @@ export const deleteTenantController = async (req, res) => {
     const { id } = req.params;
     await deleteTenantService(id);
     return res.status(200).send({
-      message: "Tenant removed successfully",
+      message: "Organization deleted successfully",
     });
   } catch (err) {
     res.status(500).send({ error: err.message });
@@ -590,26 +784,26 @@ export const getOnboardedTenantListController = async (req, res) => {
 export const getTenantSettingsController = async (req, res) => {
   try {
     const tenant_id = req.user.tenant_id;
-    console.log(`[SETTINGS GET] tenant_id=${tenant_id}`);
     const settings = await getTenantSettingsService(tenant_id);
     if (!settings) return res.status(404).json({ message: "Tenant not found" });
 
-    // NEVER send raw or encrypted key to frontend — only masked status
+    // Resolve masked key — prefer tenant_secrets (GCM), fall back to legacy CBC in ai_settings
     if (settings.ai_settings) {
-      const encryptedKey = settings.ai_settings.openai_api_key;
-      if (encryptedKey) {
-        try {
-          const rawKey = decrypt(encryptedKey);
-          settings.ai_settings.openai_api_key_masked = maskApiKey(rawKey);
-          settings.ai_settings.has_openai_key = true;
-        } catch {
-          settings.ai_settings.openai_api_key_masked = "••••••••";
-          settings.ai_settings.has_openai_key = true;
-        }
+      let rawKey = await getSecret(tenant_id, "openai");
+
+      // Legacy fallback: old CBC-encrypted key still in ai_settings JSON
+      if (!rawKey && settings.ai_settings.openai_api_key) {
+        try { rawKey = decrypt(settings.ai_settings.openai_api_key); } catch { /* ignore */ }
+      }
+
+      if (rawKey) {
+        settings.ai_settings.openai_api_key_masked = maskApiKey(rawKey);
+        settings.ai_settings.has_openai_key = true;
       } else {
         settings.ai_settings.openai_api_key_masked = "";
         settings.ai_settings.has_openai_key = false;
       }
+      // Never send raw or encrypted key to frontend
       delete settings.ai_settings.openai_api_key;
     }
 
@@ -624,31 +818,13 @@ export const updateTenantAiSettingsController = async (req, res) => {
     const tenant_id = req.user.tenant_id;
     const { ai_settings } = req.body;
 
-    // Validate model selections if provided
-    if (ai_settings?.input_model || ai_settings?.output_model) {
-      const activeModels = await db.AiPricing.findAll({
-        where: { is_active: true },
-        attributes: ["model"],
-        raw: true,
+    // Validate model selections if provided — this is the dedicated AI-settings
+    // save, so also confirm the effective credential can reach the model.
+    const aiModelValidationError = await validateAiModelSelections(ai_settings, tenant_id, true);
+    if (aiModelValidationError) {
+      return res.status(400).json({
+        message: aiModelValidationError,
       });
-      const validModels = new Set(activeModels.map((m) => m.model));
-
-      if (
-        ai_settings.input_model &&
-        !validModels.has(ai_settings.input_model)
-      ) {
-        return res.status(400).json({
-          message: `Invalid input model: ${ai_settings.input_model}. Please select an active model.`,
-        });
-      }
-      if (
-        ai_settings.output_model &&
-        !validModels.has(ai_settings.output_model)
-      ) {
-        return res.status(400).json({
-          message: `Invalid output model: ${ai_settings.output_model}. Please select an active model.`,
-        });
-      }
     }
 
     // Validate timezone if provided
@@ -661,26 +837,29 @@ export const updateTenantAiSettingsController = async (req, res) => {
       }
     }
 
-    // Encrypt the API key before storing
+    // Store OpenAI key in tenant_secrets (AES-256-GCM, per-tenant key).
+    // Never persist it in the ai_settings JSON column.
     if (ai_settings?.openai_api_key) {
-      ai_settings.openai_api_key = encrypt(ai_settings.openai_api_key);
+      await storeSecret(tenant_id, "openai", ai_settings.openai_api_key);
+      delete ai_settings.openai_api_key;
     }
 
     await updateTenantAiSettingsService(tenant_id, ai_settings);
+    invalidateOpenAIClient(tenant_id);
 
     // Return refreshed settings with masked key so frontend cache stays consistent
     const refreshed = await getTenantSettingsService(tenant_id);
     if (refreshed?.ai_settings) {
-      const encryptedKey = refreshed.ai_settings.openai_api_key;
-      if (encryptedKey) {
-        try {
-          const rawKey = decrypt(encryptedKey);
-          refreshed.ai_settings.openai_api_key_masked = maskApiKey(rawKey);
-          refreshed.ai_settings.has_openai_key = true;
-        } catch {
-          refreshed.ai_settings.openai_api_key_masked = "••••••••";
-          refreshed.ai_settings.has_openai_key = true;
-        }
+      let rawKey = await getSecret(tenant_id, "openai");
+
+      // Legacy fallback for tenants not yet migrated
+      if (!rawKey && refreshed.ai_settings.openai_api_key) {
+        try { rawKey = decrypt(refreshed.ai_settings.openai_api_key); } catch { /* ignore */ }
+      }
+
+      if (rawKey) {
+        refreshed.ai_settings.openai_api_key_masked = maskApiKey(rawKey);
+        refreshed.ai_settings.has_openai_key = true;
       } else {
         refreshed.ai_settings.openai_api_key_masked = "";
         refreshed.ai_settings.has_openai_key = false;

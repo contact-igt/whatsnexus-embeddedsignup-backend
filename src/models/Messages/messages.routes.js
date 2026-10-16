@@ -18,8 +18,7 @@ import {
 } from "../../middlewares/billing/billingAccessGuard.js";
 
 const Router = express.Router();
-
-const tenantRoles = ["tenant_admin", "doctor", "staff", "agent"];
+const tenantRoles = ["tenant_admin", "staff"];
 
 Router.get(
   "/chats",

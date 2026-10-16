@@ -67,6 +67,7 @@ export const MessagesTable = (sequelize, Sequelize) => {
           "location",
           "contact",
           "template",
+          "interactive",
         ),
         allowNull: false,
         defaultValue: "text",
@@ -100,11 +101,38 @@ export const MessagesTable = (sequelize, Sequelize) => {
         comment: "Stores the name of the template if message_type is template",
       },
 
+      interactive_payload: {
+        type: Sequelize.TEXT,
+        allowNull: true,
+        comment:
+          "JSON string of interactive button/list payload for dashboard rendering",
+      },
+
       status: {
         type: Sequelize.ENUM("sent", "delivered", "read", "failed"),
         allowNull: true,
         defaultValue: null,
         comment: "Delivery status for outgoing messages",
+      },
+
+      billing_mode_snapshot: {
+        type: Sequelize.ENUM("prepaid", "postpaid"),
+        allowNull: true,
+        comment: "Billing mode authorized for an outbound message",
+      },
+      billing_reconciliation_status: {
+        type: Sequelize.ENUM("resolved", "unresolved_billing"),
+        allowNull: true,
+        defaultValue: null,
+        comment:
+          "Set by reconciliation when outbound billing is missing or later resolved",
+      },
+
+      billing_reconciliation_checked_at: {
+        type: Sequelize.DATE,
+        allowNull: true,
+        comment:
+          "Last time reconciliation checked this message for missing billing",
       },
 
       seen: {
@@ -162,6 +190,10 @@ export const MessagesTable = (sequelize, Sequelize) => {
         {
           name: "idx_msg_deleted",
           fields: ["is_deleted"],
+        },
+        {
+          name: "idx_msg_billing_reconciliation_status",
+          fields: ["billing_reconciliation_status"],
         },
       ],
     },

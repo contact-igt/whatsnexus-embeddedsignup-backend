@@ -9,17 +9,18 @@ import {
     getContactGroupByIdController,
     addContactsToGroupController,
     removeContactFromGroupController,
-    deleteContactGroupController,
-    permanentDeleteContactGroupController,
     updateContactGroupController,
     getAvailableContactsController,
-    getDeletedContactGroupListController,
-    restoreContactGroupController,
 } from "./contactGroup.controller.js";
+import {
+    softDeleteContactGroupController,
+    hardDeleteContactGroupController,
+    restoreContactGroupController,
+    getDeletedContactGroupsController,
+} from "./contactgroup.lifecycle.js";
 
 const router = express.Router();
-
-const tenantRoles = ["tenant_admin", "doctor", "staff", "agent"];
+const tenantRoles = ["tenant_admin", "staff"];
 
 // Create a new group
 router.post(
@@ -34,7 +35,7 @@ router.get(
     "/contact-group/deleted/list",
     authenticate,
     authorize({ user_type: "tenant", roles: tenantRoles }),
-    getDeletedContactGroupListController
+    getDeletedContactGroupsController
 );
 
 // Get all groups
@@ -98,7 +99,7 @@ router.delete(
     "/contact-group/:group_id/soft",
     authenticate,
     authorize({ user_type: "tenant", roles: tenantRoles }),
-    deleteContactGroupController
+    softDeleteContactGroupController
 );
 
 // Delete a group (permanent)
@@ -106,7 +107,7 @@ router.delete(
     "/contact-group/:group_id/permanent",
     authenticate,
     authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
-    permanentDeleteContactGroupController
+    hardDeleteContactGroupController
 );
 
 export default router;

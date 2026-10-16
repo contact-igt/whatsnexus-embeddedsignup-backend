@@ -4,6 +4,7 @@
  */
 
 import net from "net";
+import { logger } from "../logger.js";
 
 let Queue;
 let billingQueue = null;
@@ -16,14 +17,30 @@ const REDIS_CONNECT_TIMEOUT_MS = Number(
   process.env.BILLING_QUEUE_CONNECT_TIMEOUT_MS || 1200,
 );
 
+// Per-environment keyspace isolation — must match campaignQueue.js. Stage and
+// Production share one Redis; without a distinct prefix a billing job enqueued by
+// one environment can be processed by the other's worker against the wrong DB.
+const BULL_PREFIX = (() => {
+  const env = String(process.env.BULLMQ_QUEUE_PREFIX || "").trim();
+  return env ? `bull-${env}` : "bull";
+})();
+
+const parseBooleanEnv = (value, defaultValue = true) => {
+  if (value === undefined || value === null || value === "") return defaultValue;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "n", "off"].includes(normalized)) return false;
+  return defaultValue;
+};
+
 const logQueueDisabledOnce = (message, detail) => {
   if (queueDisableLogged) return;
   queueDisableLogged = true;
   if (detail) {
-    console.warn(message, detail);
+    logger.warn(message, detail);
     return;
   }
-  console.warn(message);
+  logger.warn(message);
 };
 
 const isRedisConnectionError = (error) => {
@@ -108,9 +125,8 @@ const disableQueue = async (message, error) => {
   try {
     await queueToClose.close();
   } catch (closeErr) {
-    console.warn(
-      "[BILLING-QUEUE] Failed to close queue after disabling:",
-      closeErr.message,
+    logger.warn(
+      `[BILLING-QUEUE] Failed to close queue after disabling: ${closeErr.message}`,
     );
   } finally {
     queueDisabling = false;
@@ -126,12 +142,23 @@ export const initBillingQueue = async () => {
   queueDisabling = false;
 
   try {
+    const queueEnabled = parseBooleanEnv(
+      process.env.BILLING_QUEUE_ENABLED,
+      true,
+    );
+    if (!queueEnabled) {
+      billingQueue = null;
+      queueAvailable = false;
+      logger.info("[BILLING-QUEUE] Disabled via BILLING_QUEUE_ENABLED=false");
+      return;
+    }
+
     const redisUrl = process.env.REDIS_URL || DEFAULT_REDIS_URL;
 
     const redisStatus = await checkRedisReachability(redisUrl);
     if (!redisStatus.ok) {
       await disableQueue(
-        "[BILLING-QUEUE] Redis not reachable — queue disabled, using sync processing.",
+        "[BILLING-QUEUE] Redis not reachable - queue disabled, using sync processing.",
         redisStatus.reason,
       );
       return;
@@ -142,6 +169,7 @@ export const initBillingQueue = async () => {
     Queue = BullModule.default || BullModule;
 
     billingQueue = new Queue("billing-processing", redisUrl, {
+      prefix: BULL_PREFIX,
       defaultJobOptions: {
         attempts: 3,
         backoff: { type: "exponential", delay: 1000 },
@@ -154,7 +182,7 @@ export const initBillingQueue = async () => {
     await billingQueue.isReady();
     queueAvailable = true;
 
-    console.log("[BILLING-QUEUE] Initialized successfully with Redis");
+    logger.info("[BILLING-QUEUE] Initialized successfully with Redis");
 
     // Set up worker
     billingQueue.process(5, async (job) => {
@@ -167,9 +195,8 @@ export const initBillingQueue = async () => {
     });
 
     billingQueue.on("failed", (job, err) => {
-      console.error(
-        `[BILLING-QUEUE] Job ${job.id} failed (attempt ${job.attemptsMade}):`,
-        err.message,
+      logger.error(
+        `[BILLING-QUEUE] Job ${job.id} failed (attempt ${job.attemptsMade}): ${err.message}`,
       );
     });
 
@@ -180,16 +207,16 @@ export const initBillingQueue = async () => {
 
       if (isRedisConnectionError(error)) {
         void disableQueue(
-          "[BILLING-QUEUE] Redis connection lost — queue disabled, using sync processing.",
+          "[BILLING-QUEUE] Redis connection lost - queue disabled, using sync processing.",
           error,
         );
         return;
       }
-      console.error("[BILLING-QUEUE] Queue error:", error.message);
+      logger.error(`[BILLING-QUEUE] Queue error: ${error.message}`);
     });
   } catch (err) {
     await disableQueue(
-      "[BILLING-QUEUE] Redis not available — queue disabled, using sync processing.",
+      "[BILLING-QUEUE] Redis not available - queue disabled, using sync processing.",
       err,
     );
   }
@@ -211,9 +238,8 @@ export const enqueueBillingJob = async (tenant_id, statusUpdate) => {
       );
       return true;
     } catch (err) {
-      console.error(
-        "[BILLING-QUEUE] Enqueue failed, falling back to sync:",
-        err.message,
+      logger.error(
+        `[BILLING-QUEUE] Enqueue failed, falling back to sync: ${err.message}`,
       );
     }
   }
@@ -261,6 +287,6 @@ export const closeBillingQueue = async () => {
     billingQueue = null;
     queueAvailable = false;
     await queueToClose.close();
-    console.log("[BILLING-QUEUE] Closed gracefully");
+    logger.info("[BILLING-QUEUE] Closed gracefully");
   }
 };

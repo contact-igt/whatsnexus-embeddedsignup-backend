@@ -19,6 +19,7 @@ export const BillingLedgerTable = (sequelize, Sequelize) => {
       message_usage_id: {
         type: Sequelize.INTEGER,
         allowNull: true,
+        unique: "idx_billing_ledger_message_usage",
         comment:
           "Unique constraint prevents duplicate billing for the same message (NULL for AI entries)",
       },
@@ -26,6 +27,7 @@ export const BillingLedgerTable = (sequelize, Sequelize) => {
       ai_token_usage_id: {
         type: Sequelize.INTEGER,
         allowNull: true,
+        unique: "idx_billing_ledger_ai_token_usage",
         comment:
           "FK to ai_token_usage — set for AI billing entries (NULL for message entries)",
       },
@@ -35,6 +37,12 @@ export const BillingLedgerTable = (sequelize, Sequelize) => {
         allowNull: false,
         defaultValue: "message",
         comment: "Discriminator: message billing vs AI token billing",
+      },
+
+      billing_mode_snapshot: {
+        type: Sequelize.ENUM("prepaid", "postpaid"),
+        allowNull: true,
+        comment: "Billing mode authorized when the send started",
       },
 
       template_name: {
@@ -126,6 +134,13 @@ export const BillingLedgerTable = (sequelize, Sequelize) => {
         },
       },
 
+      billing_status: {
+        type: Sequelize.ENUM("charged", "insufficient_balance", "free", "usage_limit_exceeded"),
+        allowNull: false,
+        defaultValue: "charged",
+        comment: "charged = wallet deducted or postpaid cycle updated; insufficient_balance = prepaid deduction failed; free = zero-cost entry; usage_limit_exceeded = call blocked by a daily/monthly usage limit",
+      },
+
       createdAt: {
         type: Sequelize.DATE,
         allowNull: false,
@@ -154,18 +169,8 @@ export const BillingLedgerTable = (sequelize, Sequelize) => {
           fields: ["created_at"],
         },
         {
-          name: "idx_billing_ledger_message_usage",
-          unique: true,
-          fields: ["message_usage_id"],
-        },
-        {
           name: "idx_billing_ledger_category",
           fields: ["category"],
-        },
-        {
-          name: "idx_billing_ledger_ai_token_usage",
-          unique: true,
-          fields: ["ai_token_usage_id"],
         },
         {
           name: "idx_billing_ledger_entry_type",

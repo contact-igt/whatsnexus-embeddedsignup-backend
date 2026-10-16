@@ -8,18 +8,44 @@ import {
   createCampaignController,
   getCampaignListController,
   getCampaignByIdController,
+  exportCampaignRecipientsCsvController,
   triggerCampaignExecutionController,
-  softDeleteCampaignController,
-  permanentDeleteCampaignController,
-  getDeletedCampaignListController,
-  restoreCampaignController,
-  uploadCampaignMediaController,
   estimateCampaignCostController,
+  updateCampaignStatusController,
+  retryCampaignRecipientsController,
+  campaignEventWebhookController,
+  getCampaignStatsController,
+  uploadCampaignMediaController,
+  getCampaignDiagnosticsController,
 } from "./whatsappcampaign.controller.js";
+import {
+  softDeleteCampaignController,
+  hardDeleteCampaignController,
+  restoreCampaignController,
+  getDeletedCampaignsController,
+} from "./whatsappcampaign.lifecycle.js";
 
 const router = express.Router();
+const tenantRoles = ["tenant_admin", "staff"];
 
-const tenantRoles = ["tenant_admin", "doctor", "staff", "agent"];
+const requireCampaignEventSecret = (req, res, next) => {
+  const configuredSecret = process.env.CAMPAIGN_EVENT_WEBHOOK_SECRET;
+  if (!configuredSecret) {
+    return next();
+  }
+
+  const providedSecret =
+    req.get("x-campaign-event-secret") || req.query?.secret || req.body?.secret;
+
+  if (providedSecret !== configuredSecret) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized campaign event webhook request",
+    });
+  }
+
+  return next();
+};
 
 router.post(
   "/whatsapp-campaign",
@@ -35,6 +61,13 @@ router.post(
   estimateCampaignCostController,
 );
 
+router.get(
+  "/whatsapp-campaign/list",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  getCampaignListController,
+);
+
 router.post(
   "/whatsapp-campaign/upload-media",
   authenticate,
@@ -43,7 +76,7 @@ router.post(
 );
 
 router.get(
-  "/whatsapp-campaign/list",
+  "/whatsapp-campaign",
   authenticate,
   authorize({ user_type: "tenant", roles: tenantRoles }),
   getCampaignListController,
@@ -53,7 +86,22 @@ router.get(
   "/whatsapp-campaign/deleted/list",
   authenticate,
   authorize({ user_type: "tenant", roles: tenantRoles }),
-  getDeletedCampaignListController,
+  getDeletedCampaignsController,
+);
+
+router.get(
+  "/whatsapp-campaign/diagnostics",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  // Ops/internal diagnostic surface; not called by the campaign UI.
+  getCampaignDiagnosticsController,
+);
+
+router.post(
+  "/whatsapp-campaign/retry-recipients",
+  authenticate,
+  authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
+  retryCampaignRecipientsController,
 );
 
 router.get(
@@ -61,6 +109,13 @@ router.get(
   authenticate,
   authorize({ user_type: "tenant", roles: tenantRoles }),
   getCampaignByIdController,
+);
+
+router.get(
+  "/whatsapp-campaign/:campaign_id/export",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  exportCampaignRecipientsCsvController,
 );
 
 router.post(
@@ -78,6 +133,54 @@ router.post(
   restoreCampaignController,
 );
 
+router.patch(
+  "/whatsapp-campaign/:campaign_id/status",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  updateCampaignStatusController,
+);
+router.post(
+  "/whatsapp-campaign/:campaign_id/status",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  updateCampaignStatusController,
+);
+router.patch(
+  "/whatsapp-campaign/:id/status",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  (req, _res, next) => {
+    req.params.campaign_id = req.params.id;
+    next();
+  },
+  updateCampaignStatusController,
+);
+router.post(
+  "/whatsapp-campaign/:id/status",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  (req, _res, next) => {
+    req.params.campaign_id = req.params.id;
+    next();
+  },
+  updateCampaignStatusController,
+);
+
+router.post(
+  "/whatsapp-campaign/event",
+  // Optional external campaign event webhook. It is intentionally not a
+  // frontend route and should be protected with CAMPAIGN_EVENT_WEBHOOK_SECRET.
+  requireCampaignEventSecret,
+  campaignEventWebhookController,
+);
+
+router.get(
+  "/whatsapp-campaign/:campaign_id/stats",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  getCampaignStatsController,
+);
+
 router.delete(
   "/whatsapp-campaign/:campaign_id/soft",
   authenticate,
@@ -89,7 +192,46 @@ router.delete(
   "/whatsapp-campaign/:campaign_id/permanent",
   authenticate,
   authorize({ user_type: "tenant", roles: ["tenant_admin"] }),
-  permanentDeleteCampaignController,
+  hardDeleteCampaignController,
+);
+
+// Compatibility aliases for older API clients. The frontend canonical path is
+// /whatsapp/whatsapp-campaign; do not add new UI callers to /campaigns.
+router.post(
+  "/campaigns",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  createCampaignController,
+);
+router.get(
+  "/campaigns",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  getCampaignListController,
+);
+router.get(
+  "/campaigns/:campaign_id",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  getCampaignByIdController,
+);
+router.patch(
+  "/campaigns/:campaign_id/status",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  updateCampaignStatusController,
+);
+router.post(
+  "/campaigns/:campaign_id/status",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  updateCampaignStatusController,
+);
+router.delete(
+  "/campaigns/:campaign_id",
+  authenticate,
+  authorize({ user_type: "tenant", roles: tenantRoles }),
+  softDeleteCampaignController,
 );
 
 export default router;
