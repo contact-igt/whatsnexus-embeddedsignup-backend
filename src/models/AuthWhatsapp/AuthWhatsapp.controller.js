@@ -15,6 +15,57 @@ import {
   queuePendingMessage,
   consumePendingMessage,
 } from "./AuthWhatsapp.service.js";
+import {
+  handleAppointmentIntent as handleLegacyAppointmentIntent,
+  handleConfirmation as handleLegacyAppointmentConfirmation,
+} from "../AppointmentModel/appointmentConversation.service.js";
+import {
+  buildAvailableDoctorListAppointmentResponse,
+  handleAdvancedAppointmentBooking,
+} from "../AppointmentModel/Advanced_Appointment_Booking.service.js";
+import {
+  APPOINTMENT_BOOKING_TYPES,
+  getAppointmentBookingAutomationSettings,
+  handleAppointmentBookingAiAgent,
+  shouldUseAppointmentAiAgent,
+} from "../AppointmentModel/appointmentBookingAiAgent.service.js";
+import {
+  handleManageBookedAppointments,
+  hasActiveManageAppointmentSession,
+} from "../AppointmentModel/Manage_Booked_Appointments.service.js";
+import {
+  cancelAppointmentSession,
+  getActiveAppointmentSession,
+  isSessionExpired,
+} from "../AppointmentModel/appointmentSession.service.js";
+import {
+  clearManageAppointmentSession,
+  MANAGE_APPOINTMENT_SESSION_STATUS,
+} from "../AppointmentModel/manageAppointmentSession.service.js";
+import { releaseLockedSlots } from "../AppointmentModel/appointmentSlotLock.service.js";
+import { verifyWebhookToken } from "./webhookVerification.core.js";
+import { isDoctorListRequest } from "../AppointmentModel/appointmentRoutingGuard.service.js";
+import {
+  APPOINTMENT_OPERATION_ROUTES,
+  BOOKING_TO_MANAGE_SWITCH_REPLY_IDS,
+  canonicalizeManageOperationMessage,
+  getAppointmentOperationRouterMode,
+  isAppointmentOperationDecisionEnabled,
+  isManageSwitchRequestFromBookingReplyId,
+  logAppointmentOperationRouterDecision,
+  normalizeAppointmentOperationInput,
+  routeAppointmentOperation,
+} from "../AppointmentModel/appointmentOperationRouter.service.js";
+import {
+  buildBookingToManageSwitchConfirmPayload,
+  sendAppointmentPayload,
+} from "../AppointmentModel/whatsappAppointmentTemplates.service.js";
+import {
+  parseButtonReply,
+  sendQuickReply,
+  sendListMessage,
+  sendAppointmentCard,
+} from "./whatsappButtons.service.js"; // NEW
 
 import { processBillingFromWebhook } from "../BillingModel/billing.service.js";
 import {
@@ -113,19 +164,21 @@ export const verifyWebhook = async (req, res) => {
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
 
-    if (mode === "subscribe" && token && tenantId) {
-      // Find tenant strictly from DB - NO env fallback
-      const tenant = await findTenantByIdService(tenantId);
-      const expectedToken = tenant?.verify_token;
+    const verification = await verifyWebhookToken({
+      mode,
+      token,
+      tenantId,
+      commonToken: process.env.WHATSNEXUS_META_WEBHOOK_VERIFY_TOKEN,
+      findTenant: findTenantByIdService,
+    });
 
-      if (expectedToken && token === expectedToken) {
-        // Mark webhook as verified in the database
-        await updateTenantWebhookStatusService(tenantId, true);
-        return res.status(200).send(challenge);
+    if (verification.valid) {
+      if (verification.tenantId) {
+        await updateTenantWebhookStatusService(verification.tenantId, true);
       }
+      return res.status(200).send(challenge);
     }
 
-    // No more fallback to META_VERIFY_TOKEN in env
     return res.sendStatus(403);
   } catch (err) {
     console.error("Verify Webhook error:", err);
