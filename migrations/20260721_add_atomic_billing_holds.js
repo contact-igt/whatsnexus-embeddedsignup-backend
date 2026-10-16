@@ -34,7 +34,7 @@ const ensureHoldTable = async () => {
   if (await describe("billing_holds")) return;
   await qi.createTable("billing_holds", {
     id: { type: S.BIGINT, allowNull: false, autoIncrement: true, primaryKey: true },
-    hold_id: { type: S.STRING(96), allowNull: false, unique: true },
+    hold_id: { type: S.STRING(96), allowNull: false },
     tenant_id: { type: S.STRING, allowNull: false },
     campaign_id: { type: S.STRING, allowNull: true },
     billing_mode: { type: S.ENUM("prepaid", "postpaid"), allowNull: false },
@@ -52,6 +52,7 @@ const ensureHoldTable = async () => {
     created_at: { type: S.DATE, allowNull: false, defaultValue: S.literal("CURRENT_TIMESTAMP") },
     updated_at: { type: S.DATE, allowNull: false, defaultValue: S.literal("CURRENT_TIMESTAMP") },
   }, { charset: "utf8mb4", collate: "utf8mb4_unicode_ci" });
+  await qi.addIndex("billing_holds", ["hold_id"], { name: "uq_billing_holds_hold_id", unique: true });
   await qi.addIndex("billing_holds", ["tenant_id", "status"], { name: "idx_billing_holds_tenant_status" });
   await qi.addIndex("billing_holds", ["campaign_id"], { name: "idx_billing_holds_campaign" });
   await qi.addIndex("billing_holds", ["status", "expires_at"], { name: "idx_billing_holds_expiry" });

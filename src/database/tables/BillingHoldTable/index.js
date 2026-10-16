@@ -5,7 +5,7 @@ export const BillingHoldTable = (sequelize, Sequelize) =>
     tableNames.BILLING_HOLDS,
     {
       id: { type: Sequelize.BIGINT, autoIncrement: true, primaryKey: true },
-      hold_id: { type: Sequelize.STRING(96), allowNull: false, unique: true },
+      hold_id: { type: Sequelize.STRING(96), allowNull: false },
       tenant_id: { type: Sequelize.STRING, allowNull: false },
       campaign_id: { type: Sequelize.STRING, allowNull: true },
       billing_mode: {
@@ -41,6 +41,7 @@ export const BillingHoldTable = (sequelize, Sequelize) =>
       timestamps: true,
       underscored: true,
       indexes: [
+        { name: "uq_billing_holds_hold_id", unique: true, fields: ["hold_id"] },
         {
           name: "idx_billing_holds_tenant_status",
           fields: ["tenant_id", "status"],

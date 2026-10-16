@@ -34,15 +34,6 @@ const faqTrace = (label, data) => {
 // How recently (in hours) the same question must have been asked to skip insert
 const DEDUPE_WINDOW_HOURS = 24;
 
-// Valid ENUM values for agent_category column — must match DB schema
-const VALID_CATEGORIES = new Set(["valid_faq", "out_of_scope", "noise"]);
-
-/** Clamp category to a valid ENUM value; default to valid_faq so nothing is lost */
-const sanitizeCategory = (raw) => {
-  const val = String(raw || "").trim().toLowerCase();
-  return VALID_CATEGORIES.has(val) ? val : "valid_faq";
-};
-
 const emitFaqRealtimeUpdate = ({
   tenant_id,
   action,
