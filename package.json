@@ -11,6 +11,8 @@
     "seed:allprice": "node src/scripts/seed_all_pricing.js",
     "debug:campaign": "node src/scripts/debugCampaign.js",
     "debug:campaign:failed": "node src/scripts/debugCampaignFailed.js",
+    "migrate:tenant": "node src/scripts/migrateTenantData.js",
+    "test:migrate-tenant": "node --test src/scripts/migrateTenantData.test.js",
     "start:campaign-workers": "node src/scripts/startCampaignWorkers.js",
     "test:billing": "node --experimental-vm-modules node_modules/jest/bin/jest.js tests/billingAccess.service.test.js --runInBand"
   },
