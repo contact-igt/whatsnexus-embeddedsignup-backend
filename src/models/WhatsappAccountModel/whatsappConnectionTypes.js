@@ -22,6 +22,9 @@ const KNOWN = new Set(Object.values(WHATSAPP_CONNECTION_TYPES));
 export const resolveConnectionType = (value) =>
   KNOWN.has(value) ? value : WHATSAPP_CONNECTION_TYPES.LEGACY_MANUAL;
 
+export const isLegacyManualConnection = (value) =>
+  resolveConnectionType(value) === WHATSAPP_CONNECTION_TYPES.LEGACY_MANUAL;
+
 /**
  * Effective capabilities for an organization. Coexistence is only ever
  * effective when Embedded Signup itself is enabled.

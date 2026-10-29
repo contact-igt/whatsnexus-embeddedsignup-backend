@@ -299,7 +299,10 @@ export const updateWhatsappAccountController = async (req, res) => {
       message: "WhatsApp account updated successfully. Please test connection to verify.",
     });
   } catch (err) {
-    return res.status(500).send({ message: err.message });
+    return res.status(err.statusCode || 500).send({
+      message: err.message,
+      ...(err.code ? { code: err.code } : {}),
+    });
   }
 };
 
@@ -326,7 +329,10 @@ export const updateAccessTokenController = async (req, res) => {
         "Access token updated successfully. Please test connection to verify.",
     });
   } catch (err) {
-    return res.status(500).send({ message: err.message });
+    return res.status(err.statusCode || 500).send({
+      message: err.message,
+      ...(err.code ? { code: err.code } : {}),
+    });
   }
 };
 

@@ -15,7 +15,7 @@ import { Sequelize } from "sequelize";
 // One-off local runs may keep the two job-secret URLs in invictus-chatbot/.env.
 dotenv.config();
 
-const usage = `Usage: node src/scripts/migrateTenantData.js --source-tenant <id> --target-tenant <id> --dry-run | --apply
+const usage = `Usage: node src/scripts/migrateTenantData.js --source-tenant <id> --target-tenant <id> --dry-run | --apply | --apply-all-supported
 
 Required environment variables:
   SOURCE_DATABASE_URL       mysql://SELECT_ONLY_USER:password@host:3306/old_whatsnexus
@@ -25,7 +25,7 @@ export function parseArgs(argv) {
   const options = { mode: null, sourceTenant: null, targetTenant: null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--dry-run" || arg === "--apply") {
+    if (arg === "--dry-run" || arg === "--apply" || arg === "--apply-all-supported") {
       if (options.mode) throw new Error("Choose exactly one of --dry-run or --apply.");
       options.mode = arg.slice(2);
     } else if (arg === "--source-tenant" || arg === "--target-tenant") {
@@ -39,6 +39,36 @@ export function parseArgs(argv) {
     }
   }
   return options;
+}
+
+function assertNoConflicts(name, report) {
+  if (report.conflicts.length) throw new Error(`${name}: ${report.conflicts.length} blocking conflict(s).`);
+}
+
+export async function applyAllSupported({ sourceDb, destinationDb, sourceTenant, targetTenant }) {
+  const context = { sourceDb, destinationDb, sourceTenant, targetTenant };
+  const steps = [
+    ["Contacts", migrateContacts],
+    ["Messages", migrateMessages],
+    ["Leads", migrateLeads],
+    ["Lead score history", migrateLeadScoreHistory],
+    ["Contact groups", migrateContactGroups],
+    ["Contact group members", migrateContactGroupMembers],
+    ["Live chats", migrateLiveChats],
+    ["Message understanding", migrateMessageUnderstanding],
+    ["Healthcare", migrateHealthcare],
+    ["Campaign history", migrateCampaignHistory],
+    ["Knowledge", migrateKnowledge],
+  ];
+  const results = [];
+  for (const [name, migrate] of steps) {
+    const preflight = await migrate({ ...context, apply: false });
+    assertNoConflicts(name, preflight);
+    const applied = await migrate({ ...context, apply: true });
+    results.push([name, applied]);
+    console.log(`${name}: imported ${applied.ready.flatMap ? applied.ready.flatMap(rows => Array.isArray(rows) ? rows : [rows]).length : applied.ready.length}; already migrated ${applied.existing.flatMap ? applied.existing.flatMap(rows => Array.isArray(rows) ? rows : [rows]).length : applied.existing.length}.`);
+  }
+  return results;
 }
 
 export function validateOptions(options, env = process.env) {
@@ -93,6 +123,7 @@ export async function dryRun({ sourceDb, destinationDb, sourceTenant, targetTena
   const leadReport = await migrateLeads({ sourceDb, destinationDb, sourceTenant, targetTenant, apply: false });
   const scoreHistoryReport = await migrateLeadScoreHistory({ sourceDb, destinationDb, sourceTenant, targetTenant, apply: false });
   const groupReport = await migrateContactGroups({ sourceDb, destinationDb, sourceTenant, targetTenant, apply: false });
+  const groupMemberReport = await migrateContactGroupMembers({ sourceDb, destinationDb, sourceTenant, targetTenant, apply: false });
   const liveChatReport = await migrateLiveChats({ sourceDb, destinationDb, sourceTenant, targetTenant, apply: false });
   const understandingReport = await migrateMessageUnderstanding({ sourceDb, destinationDb, sourceTenant, targetTenant, apply: false });
   const healthcareReport = await migrateHealthcare({ sourceDb, destinationDb, sourceTenant, targetTenant, apply: false });
@@ -104,14 +135,15 @@ export async function dryRun({ sourceDb, destinationDb, sourceTenant, targetTena
   console.log(`Leads: ${leadReport.ready.length} ready, ${leadReport.existing.length} already migrated, ${leadReport.conflicts.length} blocking conflicts.`);
   console.log(`Lead score history: ${scoreHistoryReport.ready.length} ready, ${scoreHistoryReport.existing.length} already migrated, ${scoreHistoryReport.conflicts.length} blocking conflicts.`);
   console.log(`Contact groups: ${groupReport.ready.length} ready, ${groupReport.existing.length} already migrated, ${groupReport.conflicts.length} blocking conflicts.`);
+  console.log(`Contact group members: ${groupMemberReport.ready.length} ready, ${groupMemberReport.existing.length} already migrated, ${groupMemberReport.conflicts.length} blocking conflicts.`);
   console.log(`Live chats: ${liveChatReport.ready.length} ready, ${liveChatReport.existing.length} already migrated, ${liveChatReport.conflicts.length} blocking conflicts.`);
   console.log(`Message understanding: ${understandingReport.ready.length} ready, ${understandingReport.existing.length} already migrated, ${understandingReport.conflicts.length} blocking conflicts.`);
   console.log(`Healthcare: ${healthcareReport.ready.map(rows => rows.length).join("/")} ready, ${healthcareReport.existing.map(rows => rows.length).join("/")} already migrated, ${healthcareReport.conflicts.length} blocking conflicts.`);
   console.log(`Campaign history: ${campaignReport.ready.map(rows => rows.length).join("/")} ready, ${campaignReport.existing.map(rows => rows.length).join("/")} already migrated, ${campaignReport.conflicts.length} blocking conflicts.`);
   console.log(`Knowledge: ${knowledgeReport.ready.map(rows => rows.length).join("/")} ready, ${knowledgeReport.existing.map(rows => rows.length).join("/")} already migrated, ${knowledgeReport.conflicts.length} blocking conflicts.`);
   console.log("No rows were written. Source access must be enforced with a SELECT-only database user.");
-  if (report.conflicts.length || messageReport.conflicts.length || leadReport.conflicts.length || scoreHistoryReport.conflicts.length || groupReport.conflicts.length || liveChatReport.conflicts.length || understandingReport.conflicts.length || healthcareReport.conflicts.length || campaignReport.conflicts.length || knowledgeReport.conflicts.length) {
-    throw new Error(`Resolve ${report.conflicts.length + messageReport.conflicts.length + leadReport.conflicts.length + scoreHistoryReport.conflicts.length + groupReport.conflicts.length + liveChatReport.conflicts.length + understandingReport.conflicts.length + healthcareReport.conflicts.length + campaignReport.conflicts.length + knowledgeReport.conflicts.length} migration conflict(s) before --apply.`);
+  if (report.conflicts.length || messageReport.conflicts.length || leadReport.conflicts.length || scoreHistoryReport.conflicts.length || groupReport.conflicts.length || groupMemberReport.conflicts.length || liveChatReport.conflicts.length || understandingReport.conflicts.length || healthcareReport.conflicts.length || campaignReport.conflicts.length || knowledgeReport.conflicts.length) {
+    throw new Error(`Resolve ${report.conflicts.length + messageReport.conflicts.length + leadReport.conflicts.length + scoreHistoryReport.conflicts.length + groupReport.conflicts.length + groupMemberReport.conflicts.length + liveChatReport.conflicts.length + understandingReport.conflicts.length + healthcareReport.conflicts.length + campaignReport.conflicts.length + knowledgeReport.conflicts.length} migration conflict(s) before --apply.`);
   }
 }
 
@@ -419,6 +451,48 @@ export async function migrateContactGroups({ sourceDb, destinationDb, sourceTena
   return { ready, existing, conflicts };
 }
 
+export function mapContactGroupMember(sourceTenant, targetTenant, member) {
+  return {
+    tenant_id: targetTenant,
+    group_id: migratedGroupId(sourceTenant, member.group_id),
+    contact_id: migratedContactId(sourceTenant, member.contact_id),
+    created_at: member.created_at,
+    updated_at: member.updated_at,
+  };
+}
+
+export async function migrateContactGroupMembers({ sourceDb, destinationDb, sourceTenant, targetTenant, apply }) {
+  const sourceRows = await sourceDb.query(
+    "SELECT group_id, contact_id, created_at, updated_at FROM contact_group_members WHERE tenant_id = :sourceTenant ORDER BY id",
+    { replacements: { sourceTenant }, type: Sequelize.QueryTypes.SELECT },
+  );
+  const mapped = sourceRows.map(member => mapContactGroupMember(sourceTenant, targetTenant, member));
+  const [groups, contacts, destinationRows] = await Promise.all([
+    destinationDb.query("SELECT group_id FROM contact_groups WHERE tenant_id = :targetTenant AND group_id IN (:ids)", { replacements: { targetTenant, ids: mapped.map(member => member.group_id) }, type: Sequelize.QueryTypes.SELECT }),
+    destinationDb.query("SELECT contact_id FROM contacts WHERE tenant_id = :targetTenant AND contact_id IN (:ids)", { replacements: { targetTenant, ids: mapped.map(member => member.contact_id) }, type: Sequelize.QueryTypes.SELECT }),
+    destinationDb.query("SELECT group_id, contact_id FROM contact_group_members WHERE tenant_id = :targetTenant", { replacements: { targetTenant }, type: Sequelize.QueryTypes.SELECT }),
+  ]);
+  const groupIds = new Set(groups.map(row => row.group_id));
+  const contactIds = new Set(contacts.map(row => row.contact_id));
+  const existingIds = new Set(destinationRows.map(row => `${row.group_id}:${row.contact_id}`));
+  const sourceIds = new Set();
+  const ready = [], existing = [], conflicts = [];
+  for (let index = 0; index < mapped.length; index += 1) {
+    const member = mapped[index];
+    const sourceMember = sourceRows[index];
+    const sourceKey = `${member.group_id}:${member.contact_id}`;
+    if (!sourceMember.group_id || !sourceMember.contact_id) conflicts.push({ reason: "missing source group or contact ID" });
+    else if (sourceIds.has(sourceKey)) conflicts.push({ reason: `duplicate source group member ${sourceKey}` });
+    else if (!groupIds.has(member.group_id) || !contactIds.has(member.contact_id)) conflicts.push({ reason: `missing mapped group or contact for ${sourceKey}` });
+    else if (existingIds.has(sourceKey)) existing.push(member);
+    else ready.push(member);
+    sourceIds.add(sourceKey);
+  }
+  if (!apply || conflicts.length) return { ready, existing, conflicts };
+  await destinationDb.transaction(transaction => bulkInsert(destinationDb, "contact_group_members", ready, transaction));
+  return { ready, existing, conflicts };
+}
+
 export async function migrateLiveChats({ sourceDb, destinationDb, sourceTenant, targetTenant, apply }) {
   const sourceRows = await sourceDb.query(
     "SELECT contact_id, status, last_message_at, is_deleted, deleted_at, created_at, updated_at FROM live_chats WHERE tenant_id = :sourceTenant ORDER BY created_at",
@@ -704,6 +778,14 @@ async function main() {
     validateOptions(options);
     connections = createConnections();
     if (options.mode === "dry-run") await dryRun({ ...connections, ...options });
+    else if (options.mode === "apply-all-supported") {
+      await Promise.all([connections.sourceDb.authenticate(), connections.destinationDb.authenticate()]);
+      await Promise.all([
+        oneTenant(connections.sourceDb, options.sourceTenant, "Source"),
+        oneTenant(connections.destinationDb, options.targetTenant, "Destination"),
+      ]);
+      await applyAllSupported({ ...connections, ...options });
+    }
     else {
       await Promise.all([connections.sourceDb.authenticate(), connections.destinationDb.authenticate()]);
       await Promise.all([
@@ -715,13 +797,14 @@ async function main() {
       const leadReport = await migrateLeads({ ...connections, ...options, apply: false });
       const scoreHistoryReport = await migrateLeadScoreHistory({ ...connections, ...options, apply: false });
       const groupReport = await migrateContactGroups({ ...connections, ...options, apply: false });
+      const groupMemberReport = await migrateContactGroupMembers({ ...connections, ...options, apply: false });
       const liveChatReport = await migrateLiveChats({ ...connections, ...options, apply: false });
       const understandingReport = await migrateMessageUnderstanding({ ...connections, ...options, apply: false });
       const healthcareReport = await migrateHealthcare({ ...connections, ...options, apply: false });
       const campaignReport = await migrateCampaignHistory({ ...connections, ...options, apply: false });
       const knowledgeReport = await migrateKnowledge({ ...connections, ...options, apply: false });
-      if (contactReport.conflicts.length || messageReport.conflicts.length || leadReport.conflicts.length || scoreHistoryReport.conflicts.length || groupReport.conflicts.length || liveChatReport.conflicts.length || understandingReport.conflicts.length || healthcareReport.conflicts.length || campaignReport.conflicts.length || knowledgeReport.conflicts.length) {
-        throw new Error(`Resolve ${contactReport.conflicts.length + messageReport.conflicts.length + leadReport.conflicts.length + scoreHistoryReport.conflicts.length + groupReport.conflicts.length + liveChatReport.conflicts.length + understandingReport.conflicts.length + healthcareReport.conflicts.length + campaignReport.conflicts.length + knowledgeReport.conflicts.length} migration conflict(s) before --apply.`);
+      if (contactReport.conflicts.length || messageReport.conflicts.length || leadReport.conflicts.length || scoreHistoryReport.conflicts.length || groupReport.conflicts.length || groupMemberReport.conflicts.length || liveChatReport.conflicts.length || understandingReport.conflicts.length || healthcareReport.conflicts.length || campaignReport.conflicts.length || knowledgeReport.conflicts.length) {
+        throw new Error(`Resolve ${contactReport.conflicts.length + messageReport.conflicts.length + leadReport.conflicts.length + scoreHistoryReport.conflicts.length + groupReport.conflicts.length + groupMemberReport.conflicts.length + liveChatReport.conflicts.length + understandingReport.conflicts.length + healthcareReport.conflicts.length + campaignReport.conflicts.length + knowledgeReport.conflicts.length} migration conflict(s) before --apply.`);
       }
       const applied = await migrateKnowledge({ ...connections, ...options, apply: true });
       console.log(`Knowledge imported (sources/chunks): ${applied.ready.map(rows => rows.length).join("/")}; already migrated: ${applied.existing.map(rows => rows.length).join("/")}.`);

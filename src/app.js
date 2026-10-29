@@ -108,7 +108,13 @@ const corsOptions = {
 // or auth middleware can intercept them.
 app.use(cors(corsOptions));
 
-app.use(express.json({ limit: "10mb" })); // 25 MB — covers document uploads (largest allowed type)
+app.use(express.json({
+  limit: "10mb",
+  // Meta signs the exact request bytes. Retain only webhook payloads and never log this buffer.
+  verify: (req, _res, buf) => {
+    if (req.originalUrl?.startsWith("/api/whatsapp/webhook")) req.rawBody = Buffer.from(buf);
+  },
+})); // 25 MB — covers document uploads (largest allowed type)
 app.use(express.urlencoded({ extended: true, limit: "10mb" })); // 25 MB — covers document uploads (largest allowed type)
 
 app.use(
