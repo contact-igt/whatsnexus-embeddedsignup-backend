@@ -8,6 +8,7 @@ import {
 import {
   resolveConnectionType,
   resolveCapabilities,
+  isLegacyManualConnection,
 } from "../src/models/WhatsappAccountModel/whatsappConnectionTypes.js";
 
 const body = (echoes, over = {}) => ({
@@ -168,6 +169,13 @@ describe("legacy fallback + capabilities", () => {
     expect(resolveConnectionType(undefined)).toBe("LEGACY_MANUAL");
     expect(resolveConnectionType("garbage")).toBe("LEGACY_MANUAL");
     expect(resolveConnectionType("EMBEDDED_COEXISTENCE")).toBe("EMBEDDED_COEXISTENCE");
+  });
+
+  test("only legacy rows may use manual credential mutation routes", () => {
+    expect(isLegacyManualConnection(null)).toBe(true);
+    expect(isLegacyManualConnection("LEGACY_MANUAL")).toBe(true);
+    expect(isLegacyManualConnection("EMBEDDED_STANDARD")).toBe(false);
+    expect(isLegacyManualConnection("EMBEDDED_COEXISTENCE")).toBe(false);
   });
 
   test("existing tenants (no flags / 0) have every new capability OFF", () => {

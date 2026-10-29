@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { HEALTHCARE_TABLE_ORDER, destinationInsertId, mapCampaignRecipient, mapHealthcareAppointment, mapKnowledgeChunk, migratedContactId, migratedGroupId, migratedLeadId, migrateMessageUnderstanding, migrateMessages, parseArgs, validateOptions } from "./migrateTenantData.js";
+import { HEALTHCARE_TABLE_ORDER, destinationInsertId, mapCampaignRecipient, mapContactGroupMember, mapHealthcareAppointment, mapKnowledgeChunk, migratedContactId, migratedGroupId, migratedLeadId, migrateMessageUnderstanding, migrateMessages, parseArgs, validateOptions } from "./migrateTenantData.js";
 
 const env = {
   SOURCE_DATABASE_URL: "mysql://source:secret@old.example/whatsnexus",
@@ -29,8 +29,21 @@ test("migration group IDs are stable and distinct from lead IDs", () => {
   assert.notEqual(migratedGroupId("TT005", "GRP1"), migratedLeadId("TT005", "GRP1"));
 });
 
+test("contact-group members map to the migrated group and contact IDs", () => {
+  const mapped = mapContactGroupMember("TT013", "TT005", { group_id: "GRP1", contact_id: "CNT1" });
+  assert.equal(mapped.tenant_id, "TT005");
+  assert.equal(mapped.group_id, migratedGroupId("TT013", "GRP1"));
+  assert.equal(mapped.contact_id, migratedContactId("TT013", "CNT1"));
+});
+
 test("migration CLI accepts apply only with explicit inputs", () => {
   const options = parseArgs(["--source-tenant", "TT005", "--target-tenant", "TT105", "--apply"]);
+  assert.doesNotThrow(() => validateOptions(options, env));
+});
+
+test("migration CLI accepts the all-supported batch mode", () => {
+  const options = parseArgs(["--source-tenant", "TT013", "--target-tenant", "TT005", "--apply-all-supported"]);
+  assert.equal(options.mode, "apply-all-supported");
   assert.doesNotThrow(() => validateOptions(options, env));
 });
 

@@ -78,6 +78,7 @@ import {
   isPersistableMetaTier,
   resolveMetaTier,
 } from "../../utils/metaMessagingTier.js";
+import { isLegacyManualConnection, resolveConnectionType } from "./whatsappConnectionTypes.js";
 
 const META_API_VERSION = process.env.META_API_VERSION || "v25.0";
 
@@ -327,6 +328,7 @@ export const permanentDeleteWhatsappAccountService = async (tenant_id) => {
 
 export const updateAccessTokenService = async (tenant_id, access_token) => {
   try {
+    await assertLegacyManualMutation(tenant_id);
     // Store encrypted in tenant_secrets; reset account status so re-test is required
     await storeSecret(tenant_id, "whatsapp", access_token);
     await db.sequelize.query(
@@ -342,6 +344,7 @@ export const updateAccessTokenService = async (tenant_id, access_token) => {
 
 export const updateWhatsappAccountService = async (tenant_id, { waba_id, phone_number_id, whatsapp_number, app_id, access_token }) => {
   try {
+    await assertLegacyManualMutation(tenant_id);
     // Check if the new identifiers conflict with another tenant
     if (whatsapp_number || phone_number_id) {
       const conditions = [];
@@ -396,6 +399,23 @@ export const updateWhatsappAccountService = async (tenant_id, { waba_id, phone_n
   } catch (err) {
     throw err;
   }
+};
+
+const assertLegacyManualMutation = async (tenant_id) => {
+  const [rows] = await db.sequelize.query(
+    `SELECT whatsapp_connection_type FROM ${tableNames.WHATSAPP_ACCOUNT}
+     WHERE tenant_id = ? AND is_deleted = false LIMIT 1`,
+    { replacements: [tenant_id] },
+  );
+  const account = rows[0];
+  if (!account || isLegacyManualConnection(account.whatsapp_connection_type)) return;
+
+  const err = new Error(
+    "Embedded WhatsApp connections are managed through Meta. Use reconnect instead of editing credentials.",
+  );
+  err.statusCode = 409;
+  err.code = "EMBEDDED_CONNECTION_MANAGED";
+  throw err;
 };
 
 export const getTenantByPhoneNumberIdService = async (phone_number_id) => {
@@ -564,6 +584,9 @@ export const getComprehensiveWebhookStatusService = async (tenant_id) => {
       waba_id: account?.waba_id || null,
       whatsapp_number: account?.whatsapp_number || null,
       account_status: account?.status || null,
+      whatsapp_connection_type: account
+        ? resolveConnectionType(account.whatsapp_connection_type)
+        : null,
       quality: account?.quality || null,
       tier: account?.tier || null,
 
@@ -583,6 +606,11 @@ export const getComprehensiveWebhookStatusService = async (tenant_id) => {
       result.overall_status = "not_configured";
       return result;
     }
+
+    result.coexistence_echo_handling =
+      result.whatsapp_connection_type === "EMBEDDED_COEXISTENCE"
+        ? "enabled"
+        : "not_applicable";
 
     // 4. Validate access token
     const tokenValidation = await validateAccessTokenService(
@@ -620,11 +648,13 @@ export const getComprehensiveWebhookStatusService = async (tenant_id) => {
 
     const passedChecks = allChecks.filter((v) => v === true).length;
 
-    // If webhook is verified and token is valid, system is ready
+    // Verification proves Meta accepted the callback; the app must also be
+    // subscribed to this WABA before we report the connection as ready.
     if (
       result.webhook_verified &&
       result.access_token_valid &&
-      result.whatsapp_configured
+      result.whatsapp_configured &&
+      result.meta_subscription_active
     ) {
       result.overall_status = "ready";
       result.issues = []; // Clear issues if everything essential works

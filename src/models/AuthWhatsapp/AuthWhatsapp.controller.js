@@ -2,7 +2,6 @@
 import { downloadAndStoreIncomingMedia } from "../../services/chatAttachmentService.js";
 import { formatPhoneNumber } from "../../utils/helpers/formatPhoneNumber.js";
 import fs from "fs";
-import os from "os";
 import {
   getOpenAIReply,
   getOpenAIVisionReply,
@@ -44,6 +43,11 @@ import {
 } from "../AppointmentModel/manageAppointmentSession.service.js";
 import { releaseLockedSlots } from "../AppointmentModel/appointmentSlotLock.service.js";
 import { verifyWebhookToken } from "./webhookVerification.core.js";
+import {
+  requiresMetaWebhookSignature,
+  verifyMetaWebhookSignature,
+} from "./webhookSignature.core.js";
+import { getWebhookBatch } from "./webhookBatch.core.js";
 import { isDoctorListRequest } from "../AppointmentModel/appointmentRoutingGuard.service.js";
 import {
   APPOINTMENT_OPERATION_ROUTES,
@@ -272,7 +276,7 @@ export const verifyWebhook = async (req, res) => {
   }
 };
 
-export const receiveMessage = async (req, res) => {
+const receiveWebhookEvent = async (req, res) => {
   const io = getIO();
   try {
     const change = req.body?.entry?.[0]?.changes?.[0];
@@ -557,8 +561,7 @@ export const receiveMessage = async (req, res) => {
         });
       } else {
         console.warn(
-          `[WEBHOOK] Could not identify tenant for status update: ${messageId}. Payload:`,
-          JSON.stringify(value?.metadata),
+          `[WEBHOOK] Could not identify tenant for status update: ${messageId}.`,
         );
       }
 
@@ -900,15 +903,6 @@ export const receiveMessage = async (req, res) => {
       rawPayload: msg,
     });
 
-    // Diagnostic: log every webhook receipt to detect multi-instance delivery
-    console.log("[WEBHOOK-RECV]", {
-      pid: process.pid,
-      host: os.hostname(),
-      messageId,
-      phone,
-      tenant_id,
-    });
-
     // 4. Atomic dedupe gate. If this did not insert, Meta already delivered it.
     const didMarkMessage = await tryMarkMessageProcessed(
       tenant_id,
@@ -917,12 +911,7 @@ export const receiveMessage = async (req, res) => {
       phone,
     );
     if (!didMarkMessage) {
-      console.log("[WEBHOOK] Duplicate inbound message ignored:", {
-        tenant_id,
-        phone_number_id,
-        messageId,
-        phone,
-      });
+      console.log(`[WEBHOOK] Duplicate inbound message ignored: ${messageId}`);
       return res.sendStatus(200);
     }
 
@@ -1049,9 +1038,7 @@ export const receiveMessage = async (req, res) => {
               media_url: result.r2Url,
             });
 
-          console.log(
-            `[MEDIA-DOWNLOAD] Stored incoming ${type} → ${result.r2Url}`,
-          );
+          console.log(`[MEDIA-DOWNLOAD] Stored incoming ${type}`);
         } catch (err) {
           console.error("[MEDIA-DOWNLOAD] Async download failed:", err.message);
         }
@@ -1199,10 +1186,6 @@ export const receiveMessage = async (req, res) => {
         guardErr.message,
       );
     }
-    console.log(
-      `[REPEAT-GUARD] result for ${phone} type=${type}:`,
-      JSON.stringify(repeatGuard),
-    );
     const aiReplyStartEpoch = repeatGuard.epoch;
 
     if (repeatGuard.enabled && repeatGuard.paused) {
@@ -1278,9 +1261,7 @@ export const receiveMessage = async (req, res) => {
         }
 
         if (contactsaved?.is_ai_silenced) {
-          console.log(
-            `[WEBHOOK] AI is silenced for specific contact: ${phone}`,
-          );
+          console.log("[WEBHOOK] AI is silenced for a contact");
           return;
         }
 
@@ -1293,9 +1274,7 @@ export const receiveMessage = async (req, res) => {
             aiReplyStartEpoch,
           )
         ) {
-          console.log(
-            `[REPEAT-GUARD] Reactive AI skipped for ${phone} (paused or epoch changed)`,
-          );
+          console.log("[REPEAT-GUARD] Reactive AI skipped (paused or epoch changed)");
           return;
         }
 
@@ -1545,33 +1524,7 @@ export const receiveMessage = async (req, res) => {
           },
         );
 
-        // Log AI result for debugging UPDATE/CANCEL issues
-        console.log(`[WEBHOOK] AI Result:`, {
-          tagDetected: aiResult?.tagDetected || "NONE",
-          tagPayloadPreview: aiResult?.tagPayload?.substring(0, 150) || "N/A",
-          messagePreview: aiResult?.message?.substring(0, 200) || "N/A",
-        });
-
         // If getOpenAIReply routed an appointment intent, send the Advanced Appointment response.
-        const _apptTrace = {
-          _appointmentResult: !!aiResult?._appointmentResult,
-          tagDetected: aiResult?.tagDetected,
-          msgPreview: String(aiResult?.message || "").substring(0, 60),
-        };
-        try {
-          import("fs")
-            .then((fs) =>
-              fs.default.appendFileSync(
-                "/tmp/faq_trace.log",
-                `[${new Date().toISOString()}] [CONTROLLER] aiResult check ${JSON.stringify(_apptTrace)}\n`,
-              ),
-            )
-            .catch(() => {});
-        } catch {}
-        console.log(
-          "[FAQ-PIPELINE][CTRL] aiResult:",
-          JSON.stringify(_apptTrace),
-        );
         if (
           aiResult?._appointmentRoute &&
           isAppointmentOperationDecisionEnabled(
@@ -1745,15 +1698,11 @@ export const receiveMessage = async (req, res) => {
           isMissingInfo: resolveAiReplyEnvelope(aiResult, text)
             .isMissingInfoSignal,
           aiTag: aiResult?.tagDetected ?? null,
-          msgPreview: String(aiResult?.message || "").substring(0, 60),
         });
         if (tagToExecute) {
           faqTrace("[CONTROLLER] ▶ invoking executeTagHandler", {
             tag: tagToExecute,
-            payload: String(tagPayloadToExecute || "").substring(0, 100),
             tenant_id,
-            phone,
-            messageId: messageId || null,
             message_db_id: savedMsg?.id || null,
           });
           try {
@@ -1815,11 +1764,9 @@ export const receiveMessage = async (req, res) => {
             pending.contact_id || contactsaved?.contact_id,
           ))
         ) {
-          console.log(
-            `[REPEAT-GUARD] Dropping queued reactive AI for ${phone} (paused) — not replayed`,
-          );
+          console.log("[REPEAT-GUARD] Dropping queued reactive AI (paused)");
         } else if (pending) {
-          console.log(`[WEBHOOK] Processing queued message for ${phone}`);
+          console.log("[WEBHOOK] Processing queued message");
           const reLock = await tryAcquireLock(
             tenant_id,
             phone_number_id,
@@ -1895,7 +1842,7 @@ export const receiveMessage = async (req, res) => {
                   pending.messageId,
                 );
 
-                console.log("AI started for:", phone);
+                console.log("AI started for queued message");
 
                 const {
                   handled: queuedHandledByRouter,
@@ -2012,9 +1959,7 @@ export const receiveMessage = async (req, res) => {
                     pending.contact_id || contactsaved?.contact_id,
                   ))
                 ) {
-                  console.log(
-                    `[REPEAT-GUARD] Discarding stale queued AI reply before send for ${phone}`,
-                  );
+                  console.log("[REPEAT-GUARD] Discarding stale queued AI reply before send");
                 } else if (messageToSend) {
                   // Send to WhatsApp FIRST — abort if token error
                   let botMsgResponse = null;
@@ -2093,11 +2038,7 @@ export const receiveMessage = async (req, res) => {
                       "[CONTROLLER][QUEUED] ▶ invoking executeTagHandler",
                       {
                         tag: queuedTagToExecute,
-                        payload: String(
-                          queuedTagPayloadToExecute || "",
-                        ).substring(0, 100),
                         tenant_id,
-                        phone,
                       },
                     );
                     try {
@@ -2160,6 +2101,29 @@ export const receiveMessage = async (req, res) => {
     console.error("Webhook error:", err);
     return res.sendStatus(200);
   }
+};
+
+export const receiveMessage = async (req, res) => {
+  const appSecret = process.env.WHATSNEXUS_META_APP_SECRET?.trim();
+  if (requiresMetaWebhookSignature({ nodeEnv: process.env.NODE_ENV, appSecret }) &&
+      !verifyMetaWebhookSignature({
+        rawBody: req.rawBody,
+        signature: req.get("x-hub-signature-256"),
+        appSecret,
+      })) {
+    return res.sendStatus(401);
+  }
+
+  let failed = false;
+  for (const { entry, change } of getWebhookBatch(req.body)) {
+    const eventReq = Object.create(req);
+    eventReq.body = { ...req.body, entry: [{ ...entry, changes: [change] }] };
+    let statusCode = 200;
+    const eventRes = { sendStatus: (code) => { statusCode = code; return eventRes; } };
+    await receiveWebhookEvent(eventReq, eventRes);
+    if (statusCode >= 500) failed = true;
+  }
+  return res.sendStatus(failed ? 500 : 200);
 };
 
 async function applyAppointmentRouterLeadUpdate({
